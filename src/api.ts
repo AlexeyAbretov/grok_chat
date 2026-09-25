@@ -8,6 +8,7 @@ export type ChatTurn = {
 
 type StreamChatOptions = Omit<StreamHandlers, 'onError'> & {
   apiKey: string
+  chatId: string
   model: ModelId
   maxTokens: number
   reasoningEffort: Effort
@@ -30,6 +31,7 @@ export async function streamChat(options: StreamChatOptions) {
       ...(options.apiKey.trim() ? { 'x-api-key': options.apiKey.trim() } : {}),
     },
     body: JSON.stringify({
+      chatId: options.chatId,
       model: options.model,
       maxTokens: options.maxTokens,
       reasoningEffort: options.reasoningEffort,
@@ -55,6 +57,7 @@ export async function streamChat(options: StreamChatOptions) {
     onReasoning: options.onReasoning,
     onUsage: options.onUsage,
     onNotice: options.onNotice,
+    onTool: options.onTool,
     onError: (message) => {
       fatal = message
     },

@@ -119,6 +119,7 @@ export function App() {
     try {
       await streamChat({
         apiKey,
+        chatId,
         model: active.model,
         maxTokens: active.maxTokens,
         reasoningEffort: active.reasoningEffort,
@@ -129,6 +130,7 @@ export function App() {
           patchMessage(chatId, assistantMessage.id, (message) => ({ ...message, reasoning: message.reasoning + delta })),
         onUsage: (usage) => patchMessage(chatId, assistantMessage.id, (message) => ({ ...message, usage })),
         onNotice: (notice) => patchMessage(chatId, assistantMessage.id, (message) => ({ ...message, notice })),
+        onTool: (tool) => patchMessage(chatId, assistantMessage.id, (message) => ({ ...message, tools: [...message.tools, tool] })),
       })
     } catch (error) {
       if (isAbortError(error)) {

@@ -11,7 +11,8 @@ export function Thread({ chat, streamingMessageId }: ThreadProps) {
   const scrollerRef = useRef<HTMLDivElement>(null)
   const stickRef = useRef(true)
   const last = chat.messages[chat.messages.length - 1]
-  const tail = `${chat.messages.length}:${last?.content.length ?? 0}:${last?.reasoning.length ?? 0}`
+  const toolTail = last?.tools.map((tool) => `${tool.name}:${tool.output.length}`).join(',') ?? ''
+  const tail = `${chat.messages.length}:${last?.content.length ?? 0}:${last?.reasoning.length ?? 0}:${toolTail}`
 
   useEffect(() => {
     stickRef.current = true
@@ -37,6 +38,7 @@ export function Thread({ chat, streamingMessageId }: ThreadProps) {
         <div className="empty">
           <h2>Начните разговор</h2>
           <p>История этого чата сохранится в браузере. Можно держать несколько диалогов рядом.</p>
+          <p>В ответах есть калькулятор, чтение папки notes и поиск по a.md, b.md и c.md.</p>
         </div>
       ) : (
         chat.messages.map((message) => (
@@ -57,12 +59,25 @@ function MessageView({ message, streaming }: { message: ChatMessage; streaming: 
   }
 
   const showReasoning = message.reasoning.length > 0
-  const waiting = streaming && !message.reasoning && !message.content && !message.error
+  const waiting = streaming && !message.reasoning && !message.content && !message.error && message.tools.length === 0
+  const continuing = streaming && !message.content && !message.error && message.tools.length > 0
 
   return (
     <article className="message assistant">
       {waiting && <p className="thinking">Размышляет…</p>}
       {showReasoning && <Reasoning text={message.reasoning} streaming={streaming} />}
+      {message.tools.length > 0 && (
+        <ul className="tools">
+          {message.tools.map((tool, index) => (
+            <li key={`${tool.name}-${index}`} className={tool.ok ? 'tool' : 'tool failed'}>
+              <b>{tool.name}</b>
+              {tool.args && <code>{tool.args}</code>}
+              <code>{tool.output}</code>
+            </li>
+          ))}
+        </ul>
+      )}
+      {continuing && <p className="thinking">Размышляет…</p>}
       {message.content && <div className="answer">{message.content}</div>}
       {message.stopped && <p className="stopped">Остановлено</p>}
       {message.notice && <p className="notice">{message.notice}</p>}

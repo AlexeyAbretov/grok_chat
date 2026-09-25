@@ -21,11 +21,19 @@ export type Usage = {
   costTicks: number | null
 }
 
+export type ToolTrace = {
+  name: string
+  args: string
+  ok: boolean
+  output: string
+}
+
 export type ChatMessage = {
   id: string
   role: 'user' | 'assistant'
   content: string
   reasoning: string
+  tools: ToolTrace[]
   usage: Usage | null
   error: string | null
   notice: string | null

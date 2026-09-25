@@ -7,6 +7,7 @@ import {
   type Effort,
   type ModelId,
   type PersistedState,
+  type ToolTrace,
 } from './types.ts'
 
 const STORAGE_KEY = 'grok-chat.v1'
@@ -60,6 +61,7 @@ export function createMessage(role: ChatMessage['role'], content: string): ChatM
     role,
     content,
     reasoning: '',
+    tools: [],
     usage: null,
     error: null,
     notice: null,
@@ -107,11 +109,29 @@ function normalizeMessage(value: unknown): ChatMessage | null {
     role: message.role,
     content: typeof message.content === 'string' ? message.content : '',
     reasoning: typeof message.reasoning === 'string' ? message.reasoning : '',
+    tools: normalizeTools(message.tools),
     usage: normalizeStoredUsage(message.usage),
     error: typeof message.error === 'string' ? message.error : null,
     notice: typeof message.notice === 'string' ? message.notice : null,
     stopped: message.stopped === true,
   }
+}
+
+function normalizeTools(value: unknown): ToolTrace[] {
+  if (!Array.isArray(value)) return []
+  const tools: ToolTrace[] = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue
+    const tool = item as Partial<ToolTrace>
+    if (typeof tool.name !== 'string' || typeof tool.output !== 'string') continue
+    tools.push({
+      name: tool.name,
+      args: typeof tool.args === 'string' ? tool.args : '',
+      ok: tool.ok === true,
+      output: tool.output,
+    })
+  }
+  return tools
 }
 
 function normalizeStoredUsage(value: unknown): ChatMessage['usage'] {

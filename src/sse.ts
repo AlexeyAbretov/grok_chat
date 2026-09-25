@@ -1,5 +1,5 @@
 import { parseJsonText } from './json-schema.ts'
-import type { Usage } from './types.ts'
+import type { ToolTrace, Usage } from './types.ts'
 
 export type StreamFlags = {
   sawTextDelta: boolean
@@ -12,6 +12,7 @@ export type StreamHandlers = {
   onUsage: (usage: Usage) => void
   onError: (message: string) => void
   onNotice: (notice: string) => void
+  onTool: (tool: ToolTrace) => void
 }
 
 export function splitSse(buffer: string): { blocks: string[]; rest: string } {
@@ -48,6 +49,19 @@ export function applyJson(value: unknown, flags: StreamFlags, handlers: StreamHa
     return
   }
 
+  if (type === 'tool') {
+    const name = typeof json.name === 'string' ? json.name : ''
+    const output = typeof json.output === 'string' ? json.output : ''
+    if (!name) return
+    handlers.onTool({
+      name,
+      args: typeof json.args === 'string' ? json.args : '',
+      ok: json.ok === true,
+      output,
+    })
+    return
+  }
+
   if (type === 'response.completed' || type === 'response.incomplete') {
     const response = asRecord(json.response) ?? json
     const usage = normalizeUsage(response.usage)
@@ -71,6 +85,7 @@ export function applyJson(value: unknown, flags: StreamFlags, handlers: StreamHa
   }
 
   if (type.endsWith('.delta')) {
+    if (type.includes('function_call') || type.includes('arguments')) return
     const delta = typeof json.delta === 'string' ? json.delta : ''
     if (!delta) return
     if (type.includes('reasoning')) {
@@ -140,10 +155,11 @@ export function errorText(value: unknown): string | null {
 function incompleteNotice(reason: string | undefined) {
   if (!reason) return 'Ответ обрезан'
   if (reason === 'max_output_tokens') return 'Достигнут лимит токенов'
+  if (reason === 'max_tool_rounds') return 'Слишком много вызовов инструментов'
   return `Ответ обрезан: ${reason}`
 }
 
-function extractOutput(response: Record<string, unknown>) {
+export function extractOutput(response: Record<string, unknown>) {
   let text = typeof response.output_text === 'string' ? response.output_text : ''
   let reasoning = ''
   let messageText = ''

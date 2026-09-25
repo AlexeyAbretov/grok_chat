@@ -23,6 +23,7 @@ export type ChatRequestMessage = {
 }
 
 export type ChatRequest = {
+  chatId: string
   model: ModelId
   reasoningEffort: Effort
   maxTokens: number
@@ -34,8 +35,9 @@ const effortIds = EFFORTS.map((item) => item.id)
 export const json_schema: JsonSchema = {
   type: 'object',
   additionalProperties: false,
-  required: ['model', 'reasoningEffort', 'maxTokens', 'messages'],
+  required: ['chatId', 'model', 'reasoningEffort', 'maxTokens', 'messages'],
   properties: {
+    chatId: { type: 'string' },
     model: { type: 'string', enum: [...MODELS] },
     reasoningEffort: { type: 'string', enum: effortIds },
     maxTokens: { type: 'integer', minimum: 1, maximum: 128_000 },
@@ -77,10 +79,12 @@ export function parseChatRequest(raw: string): { ok: true; request: ChatRequest 
   if (issue) return { ok: false, message: schemaIssueText(issue) }
   if (!isRecord(parsed.value)) return { ok: false, message: 'Неверный тип «тело»' }
 
+  const chatId = parsed.value.chatId
   const model = parsed.value.model
   const reasoningEffort = parsed.value.reasoningEffort
   const maxTokens = parsed.value.maxTokens
   const messages = parsed.value.messages
+  if (!isChatId(chatId)) return { ok: false, message: 'Недопустимое значение «chatId»' }
   if (!isModel(model) || !isEffort(reasoningEffort) || typeof maxTokens !== 'number' || !Array.isArray(messages)) {
     return { ok: false, message: 'Недопустимое значение «тело»' }
   }
@@ -97,7 +101,7 @@ export function parseChatRequest(raw: string): { ok: true; request: ChatRequest 
 
   return {
     ok: true,
-    request: { model, reasoningEffort, maxTokens, messages: typedMessages },
+    request: { chatId, model, reasoningEffort, maxTokens, messages: typedMessages },
   }
 }
 
@@ -176,6 +180,10 @@ function unclosedJson(text: string) {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+export function isChatId(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
 }
 
 function isModel(value: unknown): value is ModelId {

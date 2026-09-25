@@ -2,13 +2,22 @@ import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { parseChatRequest } from '../src/json-schema.ts'
+import { parseChatRequest, parseJsonText } from '../src/json-schema.ts'
+import { createLlmLog } from './llm-log.ts'
+import { runTool, TOOLS } from './tools.ts'
+import type { Usage } from '../src/types.ts'
+import { addUsage, consumeTurn, usageToApi } from './turn.ts'
 
 const MAX_BODY = 2_000_000
 const PORT = Number(process.env.PORT) || 8787
 const DIST = resolve('dist')
 
-const SYSTEM_PROMPT = 'You are Grok, a helpful assistant. Reply in the same language the user writes in.'
+const SYSTEM_PROMPT = [
+  'You are Grok, a helpful assistant. Reply in the same language the user writes in.',
+  'Use calculator, read_file, and search_notes when they can answer the question. Do not guess arithmetic or the contents of notes/.',
+].join(' ')
+
+const MAX_TOOL_ROUNDS = 5
 
 const STATIC_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -89,59 +98,118 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, apiKeyFromE
     return
   }
 
-  const { model, reasoningEffort, maxTokens, messages } = parsed.request
-  const input = [{ role: 'system', content: SYSTEM_PROMPT }, ...messages]
+  const { chatId, model, reasoningEffort, maxTokens, messages } = parsed.request
+  const input: unknown[] = [{ role: 'system', content: SYSTEM_PROMPT }, ...messages]
+  const llm = createLlmLog(chatId)
+  llm.line(`файл logs/${chatId}.log`)
+  llm.line(`→ ${model}, tools: ${TOOLS.map((tool) => tool.name).join(', ')}`)
+  llm.items(input)
 
   const upstreamAbort = new AbortController()
   res.on('close', () => {
     if (!res.writableEnded) upstreamAbort.abort()
   })
 
-  try {
-    const upstream = await fetch('https://api.x.ai/v1/responses', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        input,
-        max_output_tokens: maxTokens,
-        reasoning: { effort: reasoningEffort },
-        stream: true,
-        store: false,
-      }),
-      signal: upstreamAbort.signal,
-    })
+  let streaming = false
+  let usage: Usage | null = null
+  let failed: string | null = null
+  let failureStatus = 502
+  let noticeReason: string | null = null
 
-    if (!upstream.ok || !upstream.body) {
-      const text = await upstream.text()
-      writeJson(res, upstream.status || 502, { error: { message: readableUpstreamError(upstream.status, text) } })
-      return
+  try {
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+      if (upstreamAbort.signal.aborted || res.destroyed) return
+      if (round > 0) llm.line(`→ раунд ${round + 1}`)
+
+      const upstream = await fetch('https://api.x.ai/v1/responses', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          input,
+          tools: TOOLS,
+          max_output_tokens: maxTokens,
+          reasoning: { effort: reasoningEffort },
+          include: ['reasoning.encrypted_content'],
+          stream: true,
+          store: false,
+        }),
+        signal: upstreamAbort.signal,
+      })
+
+      if (!upstream.ok || !upstream.body) {
+        const text = upstream.ok ? '' : await upstream.text()
+        failed = readableUpstreamError(upstream.status, text)
+        failureStatus = upstream.ok ? 502 : upstream.status || 502
+        llm.line(`← HTTP ${failureStatus}: ${failed}`)
+        break
+      }
+
+      if (!streaming) {
+        streaming = true
+        res.statusCode = 200
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+        res.setHeader('Cache-Control', 'no-cache, no-transform')
+        res.setHeader('X-Accel-Buffering', 'no')
+      }
+
+      const turn = await consumeTurn(upstream.body, (event) => writeSse(res, event), upstreamAbort.signal)
+      if (upstreamAbort.signal.aborted || res.destroyed) return
+      usage = addUsage(usage, turn.usage)
+      llm.turn(round + 1, turn.output, turn.failed, turn.incompleteReason, turn.usage)
+      if (turn.failed) {
+        failed = turn.failed
+        break
+      }
+      if (turn.calls.length === 0) {
+        noticeReason = turn.incompleteReason
+        break
+      }
+
+      const outputs: unknown[] = []
+      for (const call of turn.calls) {
+        const parsedArgs = parseJsonText(call.arguments)
+        const result = parsedArgs.ok ? runTool(call.name, parsedArgs.value) : { ok: false as const, output: 'Некорректный JSON' }
+        await writeSse(res, { type: 'tool', name: call.name, args: preview(call.arguments), ok: result.ok, output: preview(result.output) })
+        llm.tool(call.name, result.ok, result.output)
+        outputs.push({
+          type: 'function_call_output',
+          call_id: call.callId,
+          output: result.ok ? result.output : JSON.stringify({ error: result.output }),
+        })
+      }
+      input.push(...turn.output, ...outputs)
+
+      if (round === MAX_TOOL_ROUNDS - 1) noticeReason = 'max_tool_rounds'
     }
 
-    res.statusCode = 200
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
-    res.setHeader('Cache-Control', 'no-cache, no-transform')
-    res.setHeader('X-Accel-Buffering', 'no')
-
-    const reader = upstream.body.getReader()
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (res.destroyed) {
-        upstreamAbort.abort()
-        return
-      }
-      if (!res.write(Buffer.from(value))) {
-        await new Promise((resolveDrain) => res.once('drain', resolveDrain))
-      }
+    if (upstreamAbort.signal.aborted || res.destroyed) return
+    if (!streaming) {
+      writeJson(res, failureStatus, { error: { message: failed ?? 'Пустой ответ' } })
+      return
+    }
+    if (failed) {
+      await writeSse(res, { type: 'error', error: { message: failed } })
+    } else {
+      await writeSse(res, {
+        type: noticeReason !== null ? 'response.incomplete' : 'response.completed',
+        response: {
+          status: noticeReason !== null ? 'incomplete' : 'completed',
+          ...(noticeReason !== null ? { incomplete_details: noticeReason ? { reason: noticeReason } : {} } : {}),
+          ...(usage ? { usage: usageToApi(usage) } : {}),
+        },
+      })
     }
     res.end()
   } catch (error) {
     if (upstreamAbort.signal.aborted || res.destroyed) return
-    throw error
+    if (!streaming) throw error
+    const message = error instanceof Error ? error.message : 'Внутренняя ошибка'
+    await writeSse(res, { type: 'error', error: { message } })
+    if (!res.writableEnded) res.end()
   }
 }
 
@@ -232,6 +300,22 @@ function readBody(req: IncomingMessage) {
     })
     req.on('end', () => resolveBody(Buffer.concat(chunks).toString('utf8')))
     req.on('error', reject)
+  })
+}
+
+function preview(text: string) {
+  const trimmed = text.trim()
+  if (trimmed.length <= 500) return trimmed
+  return `${trimmed.slice(0, 500)}…`
+}
+
+async function writeSse(res: ServerResponse, value: unknown) {
+  if (res.destroyed || res.writableEnded) return
+  const packet = `data: ${JSON.stringify(value)}\n\n`
+  if (res.write(packet)) return
+  await new Promise((resolveDrain) => {
+    res.once('drain', resolveDrain)
+    res.once('close', resolveDrain)
   })
 }
 

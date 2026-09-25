@@ -5,6 +5,7 @@ function assert(condition: unknown, message: string) {
 }
 
 const valid = {
+  chatId: '11111111-1111-4111-8111-111111111111',
   model: 'grok-4.7',
   reasoningEffort: 'high',
   maxTokens: 4096,
@@ -19,7 +20,7 @@ function messageFor(value: unknown) {
 }
 
 const ok = parseChatRequest(JSON.stringify(valid))
-assert(ok.ok && ok.request.messages[0].content === 'привет', 'valid request is accepted')
+assert(ok.ok && ok.request.messages[0].content === 'привет' && ok.request.chatId === valid.chatId, 'valid request is accepted')
 
 assert(messageFor({ ...valid, store: false }) === 'Лишнее поле «store»', 'extra root field is rejected')
 assert(
@@ -31,9 +32,17 @@ assert(messageFor({ ...valid, maxTokens: '4096' }) === 'Неверный тип 
 assert(messageFor({ ...valid, maxTokens: 1.5 }) === 'Неверный тип «maxTokens»', 'fractional token limit is rejected')
 assert(messageFor({ ...valid, maxTokens: 0 }) === 'Недопустимое значение «maxTokens»', 'token limit range is checked')
 assert(messageFor({ ...valid, model: 'gpt' }) === 'Недопустимое значение «model»', 'unknown model is rejected')
-assert(messageFor({ model: 'grok-4.7', reasoningEffort: 'high', maxTokens: 4096 }) === 'Нет поля «messages»', 'missing field is rejected')
+assert(
+  messageFor({ chatId: valid.chatId, model: 'grok-4.7', reasoningEffort: 'high', maxTokens: 4096 }) === 'Нет поля «messages»',
+  'missing field is rejected',
+)
 assert(messageFor({ ...valid, messages: [] }) === 'Пустое сообщение', 'empty history is rejected')
 assert(messageFor({ ...valid, messages: [{ role: 'user', content: '  ' }] }) === 'Пустое сообщение', 'blank content is rejected')
+assert(messageFor({ ...valid, chatId: '../.env' }) === 'Недопустимое значение «chatId»', 'a path is not a chat id')
+assert(messageFor({ ...valid, chatId: 'logs/chat' }) === 'Недопустимое значение «chatId»', 'a chat id must be a uuid')
+const withoutChat: Record<string, unknown> = { ...valid }
+delete withoutChat.chatId
+assert(messageFor(withoutChat) === 'Нет поля «chatId»', 'missing chat id is rejected')
 
 const truncated = parseChatRequest('{"model":"grok-4.7"')
 assert(!truncated.ok && truncated.message === 'JSON обрезан', 'truncated json is named')

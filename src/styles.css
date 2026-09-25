@@ -240,6 +240,38 @@ button { cursor: pointer; }
   background: #181610;
 }
 
+.tools {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.tool {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: #181610;
+  font-size: 13px;
+}
+
+.tool b { color: var(--accent); font-weight: 650; }
+
+.tool.failed b { color: var(--danger); }
+
+.tool code {
+  display: block;
+  margin-top: 4px;
+  max-height: 140px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-family: "Cascadia Mono", "Segoe UI Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
 .reasoning summary {
   cursor: pointer;
   padding: 8px 12px;

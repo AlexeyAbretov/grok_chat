@@ -9,6 +9,7 @@ function collect() {
     usage: null as unknown,
     errors: [] as string[],
     notices: [] as string[],
+    tools: [] as { name: string; ok: boolean; output: string }[],
   }
   const handlers: StreamHandlers = {
     onText: (delta) => {
@@ -22,6 +23,7 @@ function collect() {
     },
     onError: (message) => events.errors.push(message),
     onNotice: (notice) => events.notices.push(notice),
+    onTool: (tool) => events.tools.push(tool),
   }
   return { events, handlers }
 }
@@ -107,6 +109,22 @@ applyJson(
   limited.handlers,
 )
 assert(limited.events.notices[0] === 'Достигнут лимит токенов', 'token limit is explained')
+
+const toolLimit = collect()
+applyJson(
+  { type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'max_tool_rounds' } } },
+  flags(),
+  toolLimit.handlers,
+)
+assert(toolLimit.events.notices[0] === 'Слишком много вызовов инструментов', 'tool round limit is explained')
+
+const toolEvent = collect()
+applyJson({ type: 'tool', name: 'calculator', ok: false, args: '{"op":"div","a":1,"b":0}', output: 'Деление на ноль' }, flags(), toolEvent.handlers)
+assert(toolEvent.events.tools[0]?.output === 'Деление на ноль' && toolEvent.events.text === '', 'a tool error is not answer text')
+
+const hiddenArgs = collect()
+applySseEvent('data: {"type":"response.function_call_arguments.delta","delta":"{\\"op\\""}', flags(), hiddenArgs.handlers)
+assert(hiddenArgs.events.text === '', 'function arguments are not answer text')
 
 const cutText = collect()
 applyJson(
