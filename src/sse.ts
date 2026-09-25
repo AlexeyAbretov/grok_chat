@@ -1,3 +1,4 @@
+import { parseJsonText } from './json-schema.ts'
 import type { Usage } from './types.ts'
 
 export type StreamFlags = {
@@ -27,14 +28,12 @@ export function applySseEvent(block: string, flags: StreamFlags, handlers: Strea
   }
   const data = dataLines.join('\n')
   if (!data || data === '[DONE]') return
-  let json: unknown
-  try {
-    json = JSON.parse(data)
-  } catch {
-    handlers.onError('Не удалось разобрать ответ API')
+  const parsed = parseJsonText(data)
+  if (!parsed.ok) {
+    handlers.onError(parsed.reason === 'truncated' ? 'JSON обрезан' : 'Не удалось разобрать ответ API')
     return
   }
-  applyJson(json, flags, handlers)
+  applyJson(parsed.value, flags, handlers)
 }
 
 export function applyJson(value: unknown, flags: StreamFlags, handlers: StreamHandlers) {

@@ -108,4 +108,29 @@ applyJson(
 )
 assert(limited.events.notices[0] === 'Достигнут лимит токенов', 'token limit is explained')
 
+const cutText = collect()
+applyJson(
+  {
+    type: 'response.incomplete',
+    response: {
+      status: 'incomplete',
+      output_text: '{"answer":',
+      incomplete_details: {},
+    },
+  },
+  flags(),
+  cutText.handlers,
+)
+assert(cutText.events.text === '{"answer":', 'a cut-off answer stays plain text')
+assert(cutText.events.notices[0] === 'Ответ обрезан', 'text truncation is not a broken object')
+assert(cutText.events.errors.length === 0, 'plain text is not validated as json')
+
+const cutJson = collect()
+applySseEvent('data: {"type":"response.output_text.delta","delta":', flags(), cutJson.handlers)
+assert(cutJson.events.errors[0] === 'JSON обрезан', 'truncated event json is reported')
+
+const badJson = collect()
+applySseEvent('data: {]', flags(), badJson.handlers)
+assert(badJson.events.errors[0] === 'Не удалось разобрать ответ API', 'invalid event json is not called truncated')
+
 console.log('sse ok')

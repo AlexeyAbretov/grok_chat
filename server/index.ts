@@ -2,9 +2,8 @@ import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { parseChatRequest } from '../src/json-schema.ts'
 
-const MODELS = new Set(['grok-4.7', 'grok-4.6', 'grok-4.5'])
-const EFFORTS = new Set(['low', 'medium', 'high', 'xhigh'])
 const MAX_BODY = 2_000_000
 const PORT = Number(process.env.PORT) || 8787
 const DIST = resolve('dist')
@@ -84,37 +83,14 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, apiKeyFromE
   }
 
   const raw = await readBody(req)
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    writeJson(res, 400, { error: { message: 'Некорректный JSON' } })
+  const parsed = parseChatRequest(raw)
+  if (!parsed.ok) {
+    writeJson(res, 400, { error: { message: parsed.message } })
     return
   }
 
-  const body = asRecord(parsed)
-  const model = typeof body?.model === 'string' ? body.model : ''
-  const reasoningEffort = typeof body?.reasoningEffort === 'string' ? body.reasoningEffort : ''
-  const maxTokens = typeof body?.maxTokens === 'number' ? body.maxTokens : 0
-  const messages = Array.isArray(body?.messages) ? body.messages : null
-
-  if (!MODELS.has(model) || !EFFORTS.has(reasoningEffort) || !Number.isInteger(maxTokens) || maxTokens < 1 || maxTokens > 128000 || !messages) {
-    writeJson(res, 400, { error: { message: 'Проверьте модель, лимит токенов и историю сообщений.' } })
-    return
-  }
-
-  const input: { role: string; content: string }[] = [{ role: 'system', content: SYSTEM_PROMPT }]
-  for (const message of messages) {
-    const record = asRecord(message)
-    const role = record?.role
-    const content = record?.content
-    if ((role !== 'user' && role !== 'assistant') || typeof content !== 'string' || !content.trim()) continue
-    input.push({ role, content })
-  }
-  if (input.length < 2) {
-    writeJson(res, 400, { error: { message: 'Пустое сообщение' } })
-    return
-  }
+  const { model, reasoningEffort, maxTokens, messages } = parsed.request
+  const input = [{ role: 'system', content: SYSTEM_PROMPT }, ...messages]
 
   const upstreamAbort = new AbortController()
   res.on('close', () => {
