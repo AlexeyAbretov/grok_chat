@@ -1,4 +1,4 @@
-import { parseChatRequest } from '../src/json-schema.ts'
+import { parseChatRequest } from '../shared/json-schema.ts'
 
 function assert(condition: unknown, message: string) {
   if (!condition) throw new Error(message)
@@ -31,7 +31,10 @@ assert(messageFor({ ...valid, model: 1 }) === 'Неверный тип «model»
 assert(messageFor({ ...valid, maxTokens: '4096' }) === 'Неверный тип «maxTokens»', 'string token limit is rejected')
 assert(messageFor({ ...valid, maxTokens: 1.5 }) === 'Неверный тип «maxTokens»', 'fractional token limit is rejected')
 assert(messageFor({ ...valid, maxTokens: 0 }) === 'Недопустимое значение «maxTokens»', 'token limit range is checked')
-assert(messageFor({ ...valid, model: 'gpt' }) === 'Недопустимое значение «model»', 'unknown model is rejected')
+const anyModel = parseChatRequest(JSON.stringify({ ...valid, model: 'gpt' }))
+assert(anyModel.ok && anyModel.request.model === 'gpt', 'schema accepts a model id the catalog has not seen')
+assert(messageFor({ ...valid, model: '' }) === 'Недопустимое значение «model»', 'empty model is rejected')
+assert(messageFor({ ...valid, model: '   ' }) === 'Недопустимое значение «model»', 'blank model is rejected')
 assert(
   messageFor({ chatId: valid.chatId, model: 'grok-4.7', reasoningEffort: 'high', maxTokens: 4096 }) === 'Нет поля «messages»',
   'missing field is rejected',

@@ -1,8 +1,8 @@
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve } from 'node:path'
-import { isChatId } from '../src/json-schema.ts'
-import { extractOutput } from '../src/sse.ts'
-import type { Usage } from '../src/types.ts'
+import { isChatId } from '../shared/json-schema.ts'
+import type { Usage } from '../shared/protocol.ts'
+import { extractOutput } from '../shared/sse.ts'
 
 const CLIP = 400
 const LOGS_DIR = resolve('logs')

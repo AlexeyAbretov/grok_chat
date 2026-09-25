@@ -1,4 +1,4 @@
-import { applyJson, applySseEvent, splitSse, type StreamFlags, type StreamHandlers } from '../src/sse.ts'
+import { applyJson, applySseEvent, splitSse, type StreamFlags, type StreamHandlers } from '../shared/sse.ts'
 
 const flags = (): StreamFlags => ({ sawTextDelta: false, sawReasoningDelta: false })
 

@@ -5,27 +5,20 @@ type SidebarProps = {
   chats: Chat[]
   activeId: string
   streamingChatId: string | null
-  apiKey: string
-  hasServerKey: boolean
   onSelect: (id: string) => void
   onCreate: () => void
   onDelete: (id: string) => void
-  onApiKey: (value: string) => void
 }
 
 export function Sidebar({
   chats,
   activeId,
   streamingChatId,
-  apiKey,
-  hasServerKey,
   onSelect,
   onCreate,
   onDelete,
-  onApiKey,
 }: SidebarProps) {
   const ordered = [...chats].sort((a, b) => b.updatedAt - a.updatedAt)
-  const keyState = apiKey.trim() ? 'browser' : hasServerKey ? 'env' : 'missing'
 
   return (
     <aside className="sidebar">
@@ -69,26 +62,6 @@ export function Sidebar({
           )
         })}
       </ul>
-      <div className="key-box">
-        <label htmlFor="api-key">API-ключ xAI</label>
-        <input
-          id="api-key"
-          type="password"
-          autoComplete="off"
-          spellCheck={false}
-          placeholder="xai-…"
-          value={apiKey}
-          onChange={(event) => onApiKey(event.target.value)}
-        />
-        <p className={keyState === 'missing' ? 'key-hint warn' : 'key-hint'}>
-          {keyState === 'browser' && 'Берётся ключ из этого поля. Он перекрывает .env.'}
-          {keyState === 'env' && 'Поле пустое, Node-сервер берёт XAI_API_KEY из .env.'}
-          {keyState === 'missing' && 'Вставьте ключ или задайте XAI_API_KEY в .env и перезапустите сервер.'}
-        </p>
-        <a href="https://console.x.ai" target="_blank" rel="noreferrer">
-          Получить ключ
-        </a>
-      </div>
     </aside>
   )
 }

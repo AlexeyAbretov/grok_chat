@@ -1,31 +1,14 @@
-export const MODELS = ['grok-4.7', 'grok-4.6', 'grok-4.5'] as const
-export type ModelId = (typeof MODELS)[number]
+import { type Effort, type ToolTrace, type Usage } from '../shared/protocol.ts'
+
+export { EFFORTS, type Effort, type ToolTrace, type Usage } from '../shared/protocol.ts'
 
 export const MAX_TOKEN_OPTIONS = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768] as const
 
-export const EFFORTS = [
-  { id: 'low', label: 'мало' },
-  { id: 'medium', label: 'средне' },
-  { id: 'high', label: 'много' },
-  { id: 'xhigh', label: 'максимум' },
-] as const
-
-export type Effort = (typeof EFFORTS)[number]['id']
-
-export type Usage = {
-  inputTokens: number
-  outputTokens: number
-  reasoningTokens: number | null
-  cachedTokens: number | null
-  totalTokens: number
-  costTicks: number | null
-}
-
-export type ToolTrace = {
-  name: string
-  args: string
-  ok: boolean
-  output: string
+export type ProviderInfo = {
+  id: string
+  label: string
+  reasoning: boolean
+  models: readonly string[]
 }
 
 export type ChatMessage = {
@@ -43,7 +26,7 @@ export type ChatMessage = {
 export type Chat = {
   id: string
   title: string
-  model: ModelId
+  model: string
   maxTokens: number
   reasoningEffort: Effort
   draft: string

@@ -1,19 +1,17 @@
 import {
   EFFORTS,
   MAX_TOKEN_OPTIONS,
-  MODELS,
   type Chat,
   type ChatMessage,
   type Effort,
-  type ModelId,
   type PersistedState,
   type ToolTrace,
 } from './types.ts'
 
 const STORAGE_KEY = 'grok-chat.v1'
-export const API_KEY_STORAGE = 'grok-chat.api-key'
 
 export function loadState(): PersistedState {
+  clearStoredApiKeys()
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return freshState()
@@ -40,12 +38,12 @@ export function saveState(state: PersistedState) {
   }
 }
 
-export function createChat(): Chat {
+export function createChat(model = ''): Chat {
   const now = Date.now()
   return {
     id: crypto.randomUUID(),
     title: 'Новый чат',
-    model: 'grok-4.7',
+    model,
     maxTokens: 4096,
     reasoningEffort: 'high',
     draft: '',
@@ -76,6 +74,15 @@ export function titleFrom(text: string) {
   return `${line.slice(0, 42).trimEnd()}…`
 }
 
+function clearStoredApiKeys() {
+  try {
+    localStorage.removeItem('grok-chat.api-key')
+    localStorage.removeItem('grok-chat.api-keys')
+  } catch {
+    // Private mode can block storage; there is nothing to delete then.
+  }
+}
+
 function freshState(): PersistedState {
   const chat = createChat()
   return { chats: [chat], activeId: chat.id }
@@ -89,7 +96,7 @@ function normalizeChat(value: unknown): Chat | null {
   return {
     id: chat.id,
     title: typeof chat.title === 'string' && chat.title.trim() ? chat.title : 'Новый чат',
-    model: isModel(chat.model) ? chat.model : 'grok-4.7',
+    model: typeof chat.model === 'string' ? chat.model.trim() : '',
     maxTokens: isMaxTokens(chat.maxTokens) ? chat.maxTokens : 4096,
     reasoningEffort: isEffort(chat.reasoningEffort) ? chat.reasoningEffort : 'high',
     draft: typeof chat.draft === 'string' ? chat.draft : '',
@@ -149,10 +156,6 @@ function normalizeStoredUsage(value: unknown): ChatMessage['usage'] {
     totalTokens: usage.totalTokens,
     costTicks: typeof usage.costTicks === 'number' ? usage.costTicks : null,
   }
-}
-
-function isModel(value: unknown): value is ModelId {
-  return typeof value === 'string' && MODELS.some((model) => model === value)
 }
 
 function isEffort(value: unknown): value is Effort {

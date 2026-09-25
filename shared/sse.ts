@@ -1,5 +1,5 @@
 import { parseJsonText } from './json-schema.ts'
-import type { ToolTrace, Usage } from './types.ts'
+import type { ToolTrace, Usage } from './protocol.ts'
 
 export type StreamFlags = {
   sawTextDelta: boolean

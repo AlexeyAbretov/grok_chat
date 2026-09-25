@@ -1,18 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
-import { fetchServerKey, isAbortError, streamChat, type ChatTurn } from './api.ts'
+import { fetchProviders, isAbortError, streamChat, type ChatTurn } from './api.ts'
 import { Composer } from './components/Composer.tsx'
 import { Sidebar } from './components/Sidebar.tsx'
 import { Thread } from './components/Thread.tsx'
 import { formatTokens, formatUsdFromTicks } from './format.ts'
-import { API_KEY_STORAGE, createChat, createMessage, loadState, saveState, titleFrom } from './storage.ts'
-import { EFFORTS, MAX_TOKEN_OPTIONS, MODELS, type Chat, type ChatMessage, type Effort, type ModelId } from './types.ts'
+import { createChat, createMessage, loadState, saveState, titleFrom } from './storage.ts'
+import { EFFORTS, MAX_TOKEN_OPTIONS, type Chat, type ChatMessage, type Effort, type ProviderInfo } from './types.ts'
 
 export function App() {
   const [initial] = useState(loadState)
   const [chats, setChats] = useState<Chat[]>(initial.chats)
   const [activeId, setActiveId] = useState(initial.activeId)
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem(API_KEY_STORAGE) ?? '')
-  const [hasServerKey, setHasServerKey] = useState(false)
+  const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [streamingChatId, setStreamingChatId] = useState<string | null>(null)
   const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -25,12 +24,12 @@ export function App() {
 
   useEffect(() => {
     let cancelled = false
-    fetchServerKey()
+    fetchProviders()
       .then((value) => {
-        if (!cancelled) setHasServerKey(value)
+        if (!cancelled) setProviders(value)
       })
       .catch(() => {
-        if (!cancelled) setHasServerKey(false)
+        if (!cancelled) setProviders([])
       })
     return () => {
       cancelled = true
@@ -38,16 +37,26 @@ export function App() {
   }, [])
 
   useEffect(() => {
+    if (providers.length === 0) return
+    const known = new Set(providers.flatMap((item) => item.models))
+    const fallback = providers[0]?.models[0]
+    if (!fallback) return
+    setChats((prev) => {
+      if (prev.every((chat) => known.has(chat.model))) return prev
+      return prev.map((chat) => (known.has(chat.model) ? chat : { ...chat, model: fallback }))
+    })
+  }, [providers])
+
+  useEffect(() => {
     return () => abortRef.current?.abort()
   }, [])
 
-  function updateKey(value: string) {
-    setApiKey(value)
-    localStorage.setItem(API_KEY_STORAGE, value)
+  function defaultModel() {
+    return providers[0]?.models[0] ?? active.model
   }
 
   function createNewChat() {
-    const chat = createChat()
+    const chat = createChat(defaultModel())
     setChats((prev) => [chat, ...prev])
     setActiveId(chat.id)
   }
@@ -59,7 +68,7 @@ export function App() {
     if (streamingChatId === id) abortRef.current?.abort()
     const remaining = chats.filter((chat) => chat.id !== id)
     if (remaining.length === 0) {
-      const fresh = createChat()
+      const fresh = createChat(defaultModel())
       setChats([fresh])
       setActiveId(fresh.id)
       return
@@ -118,7 +127,6 @@ export function App() {
 
     try {
       await streamChat({
-        apiKey,
         chatId,
         model: active.model,
         maxTokens: active.maxTokens,
@@ -145,6 +153,7 @@ export function App() {
     }
   }
 
+  const provider = findProvider(providers, active.model)
   const spent = active.messages.reduce((sum, message) => sum + (message.usage?.totalTokens ?? 0), 0)
   const spentTicks = active.messages.reduce((sum, message) => sum + (message.usage?.costTicks ?? 0), 0)
   const hasCost = active.messages.some((message) => message.usage?.costTicks != null)
@@ -156,12 +165,9 @@ export function App() {
         chats={chats}
         activeId={active.id}
         streamingChatId={streamingChatId}
-        apiKey={apiKey}
-        hasServerKey={hasServerKey}
         onSelect={setActiveId}
         onCreate={createNewChat}
         onDelete={removeChat}
-        onApiKey={updateKey}
       />
       <main className="main">
         <header className="toolbar">
@@ -169,12 +175,19 @@ export function App() {
             Модель
             <select
               value={active.model}
-              onChange={(event) => patchActive({ model: event.target.value as ModelId })}
+              onChange={(event) => patchActive({ model: event.target.value })}
             >
-              {MODELS.map((model) => (
-                <option key={model} value={model}>
-                  {model}
-                </option>
+              {providers.every((item) => !item.models.includes(active.model)) && (
+                <option value={active.model}>{active.model || '…'}</option>
+              )}
+              {providers.map((item) => (
+                <optgroup key={item.id} label={item.label}>
+                  {item.models.map((model) => (
+                    <option key={model} value={model}>
+                      {model}
+                    </option>
+                  ))}
+                </optgroup>
               ))}
             </select>
           </label>
@@ -192,19 +205,21 @@ export function App() {
               ))}
             </select>
           </label>
-          <label>
-            Рассуждения
-            <select
-              value={active.reasoningEffort}
-              onChange={(event) => patchActive({ reasoningEffort: event.target.value as Effort })}
-            >
-              {EFFORTS.map((effort) => (
-                <option key={effort.id} value={effort.id}>
-                  {effort.label}
-                </option>
-              ))}
-            </select>
-          </label>
+          {(provider?.reasoning ?? true) && (
+            <label>
+              Рассуждения
+              <select
+                value={active.reasoningEffort}
+                onChange={(event) => patchActive({ reasoningEffort: event.target.value as Effort })}
+              >
+                {EFFORTS.map((effort) => (
+                  <option key={effort.id} value={effort.id}>
+                    {effort.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           {(spent > 0 || hasCost) && (
             <p className="spent">
               в этом чате {formatTokens(spent)}
@@ -224,4 +239,8 @@ export function App() {
       </main>
     </div>
   )
+}
+
+function findProvider(list: readonly ProviderInfo[], model: string) {
+  return list.find((item) => item.models.includes(model)) ?? null
 }

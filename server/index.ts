@@ -2,20 +2,17 @@ import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { parseChatRequest, parseJsonText } from '../src/json-schema.ts'
+import { parseChatRequest, parseJsonText } from '../shared/json-schema.ts'
 import { createLlmLog } from './llm-log.ts'
+import { llmForModel, providerStatus } from './providers/index.ts'
+import type { ChatInputMessage } from './providers/types.ts'
 import { runTool, TOOLS } from './tools.ts'
-import type { Usage } from '../src/types.ts'
-import { addUsage, consumeTurn, usageToApi } from './turn.ts'
+import type { Usage } from '../shared/protocol.ts'
+import { addUsage, usageToApi } from './turn.ts'
 
 const MAX_BODY = 2_000_000
 const PORT = Number(process.env.PORT) || 8787
 const DIST = resolve('dist')
-
-const SYSTEM_PROMPT = [
-  'You are Grok, a helpful assistant. Reply in the same language the user writes in.',
-  'Use calculator, read_file, and search_notes when they can answer the question. Do not guess arithmetic or the contents of notes/.',
-].join(' ')
 
 const MAX_TOOL_ROUNDS = 5
 
@@ -33,9 +30,8 @@ const STATIC_TYPES: Record<string, string> = {
 loadEnvFile()
 
 export function startServer() {
-  const apiKeyFromEnv = process.env.XAI_API_KEY ?? ''
   const server = createServer((req, res) => {
-    void handle(req, res, apiKeyFromEnv).catch((error: unknown) => {
+    void handle(req, res).catch((error: unknown) => {
       if (res.writableEnded || res.destroyed) return
       const message = error instanceof Error ? error.message : 'Внутренняя ошибка'
       writeJson(res, 500, { error: { message } })
@@ -59,35 +55,27 @@ export function startServer() {
   })
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse, apiKeyFromEnv: string) {
+async function handle(req: IncomingMessage, res: ServerResponse) {
   const path = (req.url ?? '/').split('?')[0]
   if (path === '/api/status') {
     if (req.method !== 'GET') {
       writeJson(res, 405, { error: { message: 'Метод не поддерживается' } })
       return
     }
-    writeJson(res, 200, { hasServerKey: apiKeyFromEnv.trim().length > 0 })
+    writeJson(res, 200, { providers: providerStatus() })
     return
   }
   if (path === '/api/chat') {
-    await handleChat(req, res, apiKeyFromEnv)
+    await handleChat(req, res)
     return
   }
   if (serveStatic(req, res)) return
   writeJson(res, 404, { error: { message: 'Не найдено' } })
 }
 
-async function handleChat(req: IncomingMessage, res: ServerResponse, apiKeyFromEnv: string) {
+async function handleChat(req: IncomingMessage, res: ServerResponse) {
   if (req.method !== 'POST') {
     writeJson(res, 405, { error: { message: 'Метод не поддерживается' } })
-    return
-  }
-
-  const apiKey = normalizeKey(headerValue(req.headers['x-api-key'])) || normalizeKey(apiKeyFromEnv)
-  if (!apiKey) {
-    writeJson(res, 400, {
-      error: { message: 'Нет API-ключа. Вставьте его слева или задайте XAI_API_KEY в .env и перезапустите сервер.' },
-    })
     return
   }
 
@@ -99,10 +87,25 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, apiKeyFromE
   }
 
   const { chatId, model, reasoningEffort, maxTokens, messages } = parsed.request
-  const input: unknown[] = [{ role: 'system', content: SYSTEM_PROMPT }, ...messages]
+  const provider = llmForModel(model)
+  if (!provider) {
+    writeJson(res, 400, { error: { message: 'Неизвестная модель' } })
+    return
+  }
+
+  const apiKey = normalizeKey(process.env[provider.envVar] ?? '')
+  if (!apiKey) {
+    writeJson(res, 400, {
+      error: { message: `Нет API-ключа. Задайте ${provider.envVar} в .env и перезапустите сервер.` },
+    })
+    return
+  }
+
+  const input: ChatInputMessage[] = [{ role: 'system', content: provider.systemPrompt }, ...messages]
+  let transcript: unknown[] = []
   const llm = createLlmLog(chatId)
   llm.line(`файл logs/${chatId}.log`)
-  llm.line(`→ ${model}, tools: ${TOOLS.map((tool) => tool.name).join(', ')}`)
+  llm.line(`→ ${provider.id}/${model}, tools: ${TOOLS.map((tool) => tool.name).join(', ')}`)
   llm.items(input)
 
   const upstreamAbort = new AbortController()
@@ -121,43 +124,32 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, apiKeyFromE
       if (upstreamAbort.signal.aborted || res.destroyed) return
       if (round > 0) llm.line(`→ раунд ${round + 1}`)
 
-      const upstream = await fetch('https://api.x.ai/v1/responses', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          input,
-          tools: TOOLS,
-          max_output_tokens: maxTokens,
-          reasoning: { effort: reasoningEffort },
-          include: ['reasoning.encrypted_content'],
-          stream: true,
-          store: false,
-        }),
+      const turn = await provider.streamTurn({
+        apiKey,
+        model,
+        messages: input,
+        transcript,
+        tools: TOOLS,
+        maxTokens,
+        reasoningEffort,
         signal: upstreamAbort.signal,
+        beginStream: () => {
+          if (streaming) return
+          streaming = true
+          res.statusCode = 200
+          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+          res.setHeader('Cache-Control', 'no-cache, no-transform')
+          res.setHeader('X-Accel-Buffering', 'no')
+        },
+        emit: (event) => writeSse(res, event),
       })
-
-      if (!upstream.ok || !upstream.body) {
-        const text = upstream.ok ? '' : await upstream.text()
-        failed = readableUpstreamError(upstream.status, text)
-        failureStatus = upstream.ok ? 502 : upstream.status || 502
+      if (upstreamAbort.signal.aborted || res.destroyed) return
+      if (turn.failed && !streaming) {
+        failed = turn.failed
+        failureStatus = turn.httpStatus || 502
         llm.line(`← HTTP ${failureStatus}: ${failed}`)
         break
       }
-
-      if (!streaming) {
-        streaming = true
-        res.statusCode = 200
-        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
-        res.setHeader('Cache-Control', 'no-cache, no-transform')
-        res.setHeader('X-Accel-Buffering', 'no')
-      }
-
-      const turn = await consumeTurn(upstream.body, (event) => writeSse(res, event), upstreamAbort.signal)
-      if (upstreamAbort.signal.aborted || res.destroyed) return
       usage = addUsage(usage, turn.usage)
       llm.turn(round + 1, turn.output, turn.failed, turn.incompleteReason, turn.usage)
       if (turn.failed) {
@@ -169,19 +161,15 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, apiKeyFromE
         break
       }
 
-      const outputs: unknown[] = []
+      const outputs = []
       for (const call of turn.calls) {
         const parsedArgs = parseJsonText(call.arguments)
         const result = parsedArgs.ok ? runTool(call.name, parsedArgs.value) : { ok: false as const, output: 'Некорректный JSON' }
         await writeSse(res, { type: 'tool', name: call.name, args: preview(call.arguments), ok: result.ok, output: preview(result.output) })
         llm.tool(call.name, result.ok, result.output)
-        outputs.push({
-          type: 'function_call_output',
-          call_id: call.callId,
-          output: result.ok ? result.output : JSON.stringify({ error: result.output }),
-        })
+        outputs.push({ callId: call.callId, ok: result.ok, output: result.output })
       }
-      input.push(...turn.output, ...outputs)
+      transcript = [...transcript, ...turn.output, ...provider.toolOutputs(outputs)]
 
       if (round === MAX_TOOL_ROUNDS - 1) noticeReason = 'max_tool_rounds'
     }
@@ -252,36 +240,9 @@ function loadEnvFile() {
   }
 }
 
-function readableUpstreamError(status: number, text: string) {
-  const trimmed = text.trim()
-  if (/not available in your region/i.test(trimmed)) return 'Сервис xAI недоступен из этого региона.'
-  try {
-    const parsed: unknown = JSON.parse(trimmed)
-    const record = asRecord(parsed)
-    const error = record?.error
-    if (typeof error === 'string' && error.trim()) return error.trim()
-    const nested = asRecord(error)
-    if (typeof nested?.message === 'string' && nested.message.trim()) return nested.message.trim()
-    if (typeof record?.message === 'string' && record.message.trim()) return record.message.trim()
-  } catch {
-    // HTML and plain-text errors fall through.
-  }
-  const plain = trimmed
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-  return plain.slice(0, 300) || `xAI вернул ${status}`
-}
-
 function normalizeKey(raw: string) {
   const trimmed = raw.trim()
   return trimmed.toLowerCase().startsWith('bearer ') ? trimmed.slice(7).trim() : trimmed
-}
-
-function headerValue(value: string | string[] | undefined) {
-  if (Array.isArray(value)) return value[0] ?? ''
-  return value ?? ''
 }
 
 function readBody(req: IncomingMessage) {
@@ -323,11 +284,6 @@ function writeJson(res: ServerResponse, status: number, payload: unknown) {
   res.statusCode = status
   res.setHeader('Content-Type', 'application/json; charset=utf-8')
   res.end(JSON.stringify(payload))
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>
-  return null
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

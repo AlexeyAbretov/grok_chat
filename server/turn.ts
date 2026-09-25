@@ -1,6 +1,6 @@
-import { extractOutput, errorText, normalizeUsage, splitSse } from '../src/sse.ts'
-import { parseJsonText } from '../src/json-schema.ts'
-import type { Usage } from '../src/types.ts'
+import { parseJsonText } from '../shared/json-schema.ts'
+import type { Usage } from '../shared/protocol.ts'
+import { extractOutput, errorText, normalizeUsage, splitSse } from '../shared/sse.ts'
 
 export type FunctionCall = {
   callId: string

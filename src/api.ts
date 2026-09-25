@@ -1,5 +1,5 @@
-import { applyJson, applySseEvent, errorText, splitSse, type StreamFlags, type StreamHandlers } from './sse.ts'
-import type { Effort, ModelId } from './types.ts'
+import { applyJson, applySseEvent, errorText, splitSse, type StreamFlags, type StreamHandlers } from '../shared/sse.ts'
+import type { Effort, ProviderInfo } from './types.ts'
 
 export type ChatTurn = {
   role: 'user' | 'assistant'
@@ -7,29 +7,44 @@ export type ChatTurn = {
 }
 
 type StreamChatOptions = Omit<StreamHandlers, 'onError'> & {
-  apiKey: string
   chatId: string
-  model: ModelId
+  model: string
   maxTokens: number
   reasoningEffort: Effort
   messages: ChatTurn[]
   signal: AbortSignal
 }
 
-export async function fetchServerKey(): Promise<boolean> {
+export async function fetchProviders(): Promise<ProviderInfo[]> {
   const response = await fetch('/api/status')
-  if (!response.ok) return false
+  if (!response.ok) return []
   const data: unknown = await response.json()
-  return Boolean(data && typeof data === 'object' && 'hasServerKey' in data && data.hasServerKey)
+  if (!data || typeof data !== 'object' || !('providers' in data) || !Array.isArray(data.providers)) return []
+  const providers: ProviderInfo[] = []
+  for (const item of data.providers) {
+    const provider = readProvider(item)
+    if (provider) providers.push(provider)
+  }
+  return providers
+}
+
+function readProvider(value: unknown): ProviderInfo | null {
+  if (!value || typeof value !== 'object') return null
+  const provider = value as Partial<ProviderInfo>
+  if (typeof provider.id !== 'string' || !provider.id || typeof provider.label !== 'string') return null
+  if (!Array.isArray(provider.models) || provider.models.some((model) => typeof model !== 'string' || !model)) return null
+  return {
+    id: provider.id,
+    label: provider.label,
+    reasoning: provider.reasoning === true,
+    models: provider.models,
+  }
 }
 
 export async function streamChat(options: StreamChatOptions) {
   const response = await fetch('/api/chat', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options.apiKey.trim() ? { 'x-api-key': options.apiKey.trim() } : {}),
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       chatId: options.chatId,
       model: options.model,

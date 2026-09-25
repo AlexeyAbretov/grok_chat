@@ -1,4 +1,4 @@
-import { EFFORTS, MODELS, type Effort, type ModelId } from './types.ts'
+import { EFFORTS, type Effort } from './protocol.ts'
 
 export type JsonSchema =
   | { type: 'string'; enum?: readonly string[] }
@@ -24,7 +24,7 @@ export type ChatRequestMessage = {
 
 export type ChatRequest = {
   chatId: string
-  model: ModelId
+  model: string
   reasoningEffort: Effort
   maxTokens: number
   messages: ChatRequestMessage[]
@@ -38,7 +38,7 @@ export const json_schema: JsonSchema = {
   required: ['chatId', 'model', 'reasoningEffort', 'maxTokens', 'messages'],
   properties: {
     chatId: { type: 'string' },
-    model: { type: 'string', enum: [...MODELS] },
+    model: { type: 'string' },
     reasoningEffort: { type: 'string', enum: effortIds },
     maxTokens: { type: 'integer', minimum: 1, maximum: 128_000 },
     messages: {
@@ -85,7 +85,8 @@ export function parseChatRequest(raw: string): { ok: true; request: ChatRequest 
   const maxTokens = parsed.value.maxTokens
   const messages = parsed.value.messages
   if (!isChatId(chatId)) return { ok: false, message: 'Недопустимое значение «chatId»' }
-  if (!isModel(model) || !isEffort(reasoningEffort) || typeof maxTokens !== 'number' || !Array.isArray(messages)) {
+  if (!isModel(model)) return { ok: false, message: 'Недопустимое значение «model»' }
+  if (!isEffort(reasoningEffort) || typeof maxTokens !== 'number' || !Array.isArray(messages)) {
     return { ok: false, message: 'Недопустимое значение «тело»' }
   }
 
@@ -186,8 +187,8 @@ export function isChatId(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
 }
 
-function isModel(value: unknown): value is ModelId {
-  return typeof value === 'string' && MODELS.some((model) => model === value)
+function isModel(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0 && value.length <= 200
 }
 
 function isEffort(value: unknown): value is Effort {
