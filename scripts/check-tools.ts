@@ -3,6 +3,7 @@ import { relative, resolve, sep } from 'node:path'
 import { createLlmLog, formatLlmItem, llmLogPath } from '../server/llm-log.ts'
 import { locateNote, runTool, type ToolIo } from '../server/tools.ts'
 import { claudeToolPayload } from '../server/providers/claude.ts'
+import { consumeGeminiText, geminiTextCall, geminiThoughtSignature, geminiToolCall, joinGeminiMessages } from '../server/providers/gemini.ts'
 import { addUsage, consumeTurn, executeToolCalls, planToolRound } from '../server/turn.ts'
 
 function assert(condition: unknown, message: string) {
@@ -213,6 +214,29 @@ const cutPayload = claudeToolPayload('{"op":"div"')
 assert(cutPayload.arguments === '{"op":"div"' && typeof cutPayload.input === 'string', 'truncated Claude tool json is not replaced with {}')
 const emptyPayload = claudeToolPayload('')
 assert(emptyPayload.arguments === '' && emptyPayload.input === '', 'empty Claude tool json is not replaced with {}')
+const spoken = { mode: 'answer' as const, pending: '' }
+const first = consumeGeminiText(spoken, '<thought>дума')
+const second = consumeGeminiText(spoken, 'ю</thought>4')
+assert(first.thought === 'дума' && first.answer === '' && second.thought === 'ю' && second.answer === '4', 'thought tags are not answer text')
+
+const written = geminiTextCall('<call:default_api:calculator{a:1,b:1,op:add}')
+assert(written?.name === 'calculator' && written.arguments === '{"a":1,"b":1,"op":"add"}', 'a text calculator call is parsed')
+
+const glued = joinGeminiMessages([
+  { role: 'user', content: '2+2' },
+  { role: 'user', content: '2+2' },
+])
+const gluedText = (glued[0] as { content?: string }).content
+assert(glued.length === 1 && gluedText === '2+2\n2+2', 'consecutive user texts stay on separate lines')
+
+const signature = geminiThoughtSignature({ extra_content: { google: { thought_signature: 'sig' } } })
+assert(signature === 'sig', 'a gemini thought signature is read from the tool call')
+const replay = geminiToolCall({ id: 'c1', name: 'calculator', arguments: '{"op":"add","a":2,"b":2}', thoughtSignature: signature })
+const extra = replay.extra_content as { google?: { thought_signature?: string } } | undefined
+assert(extra?.google?.thought_signature === 'sig', 'a gemini tool call is replayed with its thought signature')
+const unsigned = geminiToolCall({ id: 'c2', name: 'calculator', arguments: '{}', thoughtSignature: '' })
+assert(!Object.prototype.hasOwnProperty.call(unsigned, 'extra_content'), 'a gemini call without a signature stays unsigned')
+
 const wholePayload = claudeToolPayload('{"op":"add","a":1,"b":2}')
 assert(
   wholePayload.input && typeof wholePayload.input === 'object' && (wholePayload.input as { op?: string }).op === 'add',

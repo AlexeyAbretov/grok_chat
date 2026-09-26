@@ -231,7 +231,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
       return
     }
     if (failed) {
-      await writeSse(res, { type: 'error', error: { message: failed } })
+      await writeSse(res, { type: 'error', error: { message: failed }, ...(usage ? { usage: usageToApi(usage) } : {}) })
     } else {
       await writeSse(res, {
         type: noticeReason !== null ? 'response.incomplete' : 'response.completed',

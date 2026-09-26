@@ -1,4 +1,4 @@
-import { applyJson, applySseEvent, splitSse, type StreamFlags, type StreamHandlers } from '../shared/sse.ts'
+import { applyJson, applySseEvent, normalizeUsage, splitSse, type StreamFlags, type StreamHandlers } from '../shared/sse.ts'
 
 const flags = (): StreamFlags => ({ sawTextDelta: false, sawReasoningDelta: false })
 
@@ -65,6 +65,19 @@ assert(streamed.events.usage && (streamed.events.usage as { reasoningTokens: num
 assert((streamed.events.usage as { cachedTokens: number }).cachedTokens === 4, 'cached input tokens are read')
 assert((streamed.events.usage as { costTicks: number }).costTicks === 37756000, 'cost ticks are read')
 
+const geminiThoughts = normalizeUsage({ prompt_tokens: 415, completion_tokens: 23, total_tokens: 778 })
+assert(
+  geminiThoughts?.reasoningTokens === 340 && geminiThoughts.inputTokens === 415 && geminiThoughts.outputTokens === 23 && geminiThoughts.totalTokens === 778,
+  'gemini thoughts are the gap between total and input plus output',
+)
+const priced = normalizeUsage({
+  prompt_tokens: 10,
+  completion_tokens: 4,
+  total_tokens: 18,
+  completion_tokens_details: { reasoning_tokens: 2 },
+})
+assert(priced?.reasoningTokens === 2, 'an explicit reasoning count is not replaced by the total gap')
+
 const fallback = collect()
 applyJson(
   {
@@ -101,6 +114,17 @@ assert(chunk.events.reasoning === 'шаг' && chunk.events.text === 'ок', 'cha
 const failed = collect()
 applyJson({ type: 'error', error: { message: 'нет ключа' } }, flags(), failed.handlers)
 assert(failed.events.errors[0] === 'нет ключа', 'api errors surface')
+
+const failedUsage = collect()
+applyJson(
+  { type: 'error', error: { message: 'сбой' }, usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } },
+  flags(),
+  failedUsage.handlers,
+)
+assert(
+  failedUsage.events.errors[0] === 'сбой' && (failedUsage.events.usage as { inputTokens: number }).inputTokens === 3,
+  'an error still reports usage',
+)
 
 const limited = collect()
 applyJson(

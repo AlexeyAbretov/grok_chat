@@ -45,6 +45,8 @@ export function applyJson(value: unknown, flags: StreamFlags, handlers: StreamHa
 
   if (type === 'error' || type === 'response.failed') {
     const response = asRecord(json.response)
+    const usage = normalizeUsage(json.usage) ?? normalizeUsage(response?.usage)
+    if (usage) handlers.onUsage(usage)
     handlers.onError(errorText(json.error) ?? errorText(response?.error) ?? 'Запрос не выполнен')
     return
   }
@@ -127,12 +129,18 @@ export function normalizeUsage(value: unknown): Usage | null {
   const total = asNumber(usage.total_tokens)
   const outputDetails = asRecord(usage.output_tokens_details) ?? asRecord(usage.completion_tokens_details)
   const inputDetails = asRecord(usage.input_tokens_details) ?? asRecord(usage.prompt_tokens_details)
-  const reasoning = outputDetails ? asNumber(outputDetails.reasoning_tokens) : null
-  const cached = inputDetails ? asNumber(inputDetails.cached_tokens) : asNumber(usage.cached_tokens)
+  let reasoning = outputDetails ? asNumber(outputDetails.reasoning_tokens) : null
+  if (reasoning === null) reasoning = asNumber(usage.thoughts_token_count) ?? asNumber(usage.thoughtsTokenCount)
+  const cached = inputDetails
+    ? asNumber(inputDetails.cached_tokens)
+    : (asNumber(usage.cached_tokens) ?? asNumber(usage.cached_content_token_count) ?? asNumber(usage.cachedContentTokenCount))
   const costTicks = asNumber(usage.cost_in_usd_ticks)
   if (input === null && output === null && total === null && reasoning === null && cached === null && costTicks === null) return null
   const inputTokens = input ?? 0
   const outputTokens = output ?? 0
+  if (reasoning === null && input !== null && output !== null && total !== null && total > input + output) {
+    reasoning = total - input - output
+  }
   return {
     inputTokens,
     outputTokens,

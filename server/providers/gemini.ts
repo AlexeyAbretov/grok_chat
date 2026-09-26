@@ -41,12 +41,14 @@ async function streamTurn(request: ProviderTurnRequest): Promise<StreamTurnResul
     },
     body: JSON.stringify({
       model: request.model,
-      messages: [...request.messages, ...request.transcript],
+      messages: joinGeminiMessages([...request.messages, ...request.transcript]),
       tools: chatTools(request.tools),
       tool_choice: 'auto',
       max_tokens: request.maxTokens,
-      reasoning_effort: effort,
-      google: { thinking_config: { include_thoughts: true, thinking_level: effort } },
+      stream_options: { include_usage: true },
+      extra_body: {
+        google: { thinking_config: { include_thoughts: true, thinking_level: effort } },
+      },
       stream: true,
     }),
     signal: request.signal,
@@ -59,6 +61,27 @@ async function streamTurn(request: ProviderTurnRequest): Promise<StreamTurnResul
 
   request.beginStream()
   return readGeminiStream(upstream.body, request)
+}
+
+export function joinGeminiMessages(messages: readonly unknown[]) {
+  const joined: unknown[] = []
+  for (const message of messages) {
+    const current = asRecord(message)
+    const previous = asRecord(joined.at(-1))
+    if (
+      current &&
+      previous &&
+      typeof current.role === 'string' &&
+      current.role === previous.role &&
+      typeof current.content === 'string' &&
+      typeof previous.content === 'string'
+    ) {
+      joined[joined.length - 1] = { ...previous, content: `${previous.content}\n${current.content}` }
+      continue
+    }
+    joined.push(message)
+  }
+  return joined
 }
 
 function chatTools(tools: readonly object[]) {
@@ -83,10 +106,18 @@ type GeminiCall = {
   id: string
   name: string
   arguments: string
+  thoughtSignature: string
+}
+
+type GeminiTextState = {
+  mode: 'answer' | 'thought'
+  pending: string
 }
 
 type GeminiState = {
   text: string
+  shown: number
+  textState: GeminiTextState
   calls: Map<number, GeminiCall>
   usage: Usage | null
   incompleteReason: string | null
@@ -96,6 +127,8 @@ type GeminiState = {
 async function readGeminiStream(body: ReadableStream<Uint8Array>, request: ProviderTurnRequest): Promise<StreamTurnResult> {
   const state: GeminiState = {
     text: '',
+    shown: 0,
+    textState: { mode: 'answer', pending: '' },
     calls: new Map(),
     usage: null,
     incompleteReason: null,
@@ -133,11 +166,28 @@ async function readGeminiStream(body: ReadableStream<Uint8Array>, request: Provi
   }
 
   if (state.failed) return { ...emptyTurn(state.failed, 200), usage: state.usage, incompleteReason: state.incompleteReason }
-  const calls = finishCalls(state.calls)
+  const tail = flushGeminiText(state.textState)
+  if (tail.answer) state.text += tail.answer
+  if (tail.thought) await request.emit({ type: 'response.reasoning_summary_text.delta', delta: tail.thought })
+  const ordered = orderedCalls(state.calls)
+  const textCall = ordered.length === 0 ? geminiTextCall(state.text) : null
+  if (textCall) {
+    ordered.push({
+      id: 'call_text',
+      name: textCall.name,
+      arguments: textCall.arguments,
+      thoughtSignature: 'skip_thought_signature_validator',
+    })
+    state.text = ''
+    state.shown = 0
+  } else {
+    await emitAnswer(state, request, true)
+  }
+  const calls = finishCalls(ordered)
   if (!calls.ok) return { ...emptyTurn(calls.error, 200), usage: state.usage, incompleteReason: state.incompleteReason }
   return {
     calls: calls.calls,
-    output: assistantMessage(state.text, calls.calls),
+    output: assistantMessage(state.text, ordered),
     usage: state.usage,
     incompleteReason: state.incompleteReason,
     failed: null,
@@ -145,19 +195,34 @@ async function readGeminiStream(body: ReadableStream<Uint8Array>, request: Provi
   }
 }
 
-function assistantMessage(text: string, calls: FunctionCall[]) {
-  if (calls.length === 0) return []
+function assistantMessage(text: string, calls: readonly GeminiCall[]) {
+  if (calls.length === 0) return text ? [{ role: 'assistant', content: text }] : []
   return [
     {
       role: 'assistant',
       content: text || null,
-      tool_calls: calls.map((call) => ({
-        id: call.callId,
-        type: 'function',
-        function: { name: call.name, arguments: call.arguments },
-      })),
+      tool_calls: calls.map((call) => geminiToolCall(call)),
     },
   ]
+}
+
+export function geminiToolCall(call: GeminiCall) {
+  const replay: Record<string, unknown> = {
+    id: call.id,
+    type: 'function',
+    function: { name: call.name, arguments: call.arguments },
+  }
+  if (call.thoughtSignature) {
+    replay.extra_content = { google: { thought_signature: call.thoughtSignature } }
+  }
+  return replay
+}
+
+export function geminiThoughtSignature(value: unknown) {
+  const record = asRecord(value)
+  const extra = asRecord(record?.extra_content)
+  const google = asRecord(extra?.google)
+  return typeof google?.thought_signature === 'string' ? google.thought_signature : ''
 }
 
 async function applyBlock(block: string, state: GeminiState, request: ProviderTurnRequest) {
@@ -196,8 +261,12 @@ async function applyChunk(value: unknown, state: GeminiState, request: ProviderT
   if (!piece) return
   const content = typeof piece.content === 'string' ? piece.content : ''
   if (content) {
-    state.text += content
-    await request.emit({ type: 'response.output_text.delta', delta: content })
+    const parts = consumeGeminiText(state.textState, content)
+    if (parts.answer) {
+      state.text += parts.answer
+      await emitAnswer(state, request, false)
+    }
+    if (parts.thought) await request.emit({ type: 'response.reasoning_summary_text.delta', delta: parts.thought })
   }
   const reasoning = reasoningText(piece)
   if (reasoning) await request.emit({ type: 'response.reasoning_summary_text.delta', delta: reasoning })
@@ -210,8 +279,10 @@ function appendToolCalls(value: unknown, calls: Map<number, GeminiCall>) {
     const record = asRecord(item)
     if (!record) continue
     const index = typeof record.index === 'number' ? record.index : lastIndex(calls)
-    const current = calls.get(index) ?? { id: '', name: '', arguments: '' }
+    const current = calls.get(index) ?? { id: '', name: '', arguments: '', thoughtSignature: '' }
     if (typeof record.id === 'string' && record.id) current.id = record.id
+    const signature = geminiThoughtSignature(record)
+    if (signature) current.thoughtSignature = signature
     const fn = asRecord(record.function)
     if (typeof fn?.name === 'string') current.name += fn.name
     if (typeof fn?.arguments === 'string') current.arguments += fn.arguments
@@ -224,16 +295,109 @@ function lastIndex(calls: Map<number, GeminiCall>) {
   return Math.max(...calls.keys())
 }
 
+async function emitAnswer(state: GeminiState, request: ProviderTurnRequest, done: boolean) {
+  if (!done && mightBeTextCall(state.text)) return
+  const rest = state.text.slice(state.shown)
+  state.shown = state.text.length
+  if (rest) await request.emit({ type: 'response.output_text.delta', delta: rest })
+}
+
+function mightBeTextCall(text: string) {
+  const trimmed = text.trimStart()
+  if (!trimmed) return false
+  const prefix = '<call:default_api:'
+  return (prefix.startsWith(trimmed) && trimmed.length <= prefix.length) || trimmed.startsWith(prefix)
+}
+
+const THOUGHT_OPEN = '<thought>'
+const THOUGHT_CLOSE = '</thought>'
+
+export function consumeGeminiText(state: GeminiTextState, chunk: string) {
+  state.pending += chunk
+  let answer = ''
+  let thought = ''
+  while (state.pending) {
+    const tag = state.mode === 'answer' ? THOUGHT_OPEN : THOUGHT_CLOSE
+    const at = state.pending.indexOf('<')
+    if (at < 0) {
+      if (state.mode === 'answer') answer += state.pending
+      else thought += state.pending
+      state.pending = ''
+      break
+    }
+    const tail = state.pending.slice(at)
+    if (tag.startsWith(tail) && tail.length < tag.length) {
+      if (state.mode === 'answer') answer += state.pending.slice(0, at)
+      else thought += state.pending.slice(0, at)
+      state.pending = tail
+      break
+    }
+    if (tail.startsWith(tag)) {
+      if (state.mode === 'answer') answer += state.pending.slice(0, at)
+      else thought += state.pending.slice(0, at)
+      state.pending = tail.slice(tag.length)
+      state.mode = state.mode === 'answer' ? 'thought' : 'answer'
+      continue
+    }
+    if (state.mode === 'answer') answer += state.pending.slice(0, at + 1)
+    else thought += state.pending.slice(0, at + 1)
+    state.pending = state.pending.slice(at + 1)
+  }
+  return { answer, thought }
+}
+
+export function flushGeminiText(state: GeminiTextState) {
+  const text = state.pending
+  state.pending = ''
+  if (!text) return { answer: '', thought: '' }
+  return state.mode === 'thought' ? { answer: '', thought: text } : { answer: text, thought: '' }
+}
+
+export function geminiTextCall(text: string): { name: string; arguments: string } | null {
+  const match = text.trim().match(/^<call:default_api:([A-Za-z0-9_]+)\{([\s\S]*)$/)
+  if (!match) return null
+  let body = match[2].trim()
+  if (body.endsWith('>')) body = body.slice(0, -1).trim()
+  if (body.endsWith('}')) body = body.slice(0, -1)
+  const args = looseArgs(body)
+  if (!args) return null
+  return { name: match[1], arguments: JSON.stringify(args) }
+}
+
+function looseArgs(body: string) {
+  const wrapped = `{${body}}`
+  try {
+    const parsed: unknown = JSON.parse(wrapped)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+  } catch {
+    // Gemini sometimes writes {a:1,b:1,op:add} instead of JSON.
+  }
+  const args: Record<string, unknown> = {}
+  if (!body.trim()) return null
+  for (const part of body.split(',')) {
+    const eq = part.indexOf(':')
+    if (eq <= 0) return null
+    const key = part.slice(0, eq).trim()
+    const raw = part.slice(eq + 1).trim().replace(/^['"]|['"]$/g, '')
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || !raw) return null
+    args[key] = /^-?\d+(\.\d+)?$/.test(raw) ? Number(raw) : raw
+  }
+  return args
+}
+
 function reasoningText(delta: Record<string, unknown>) {
   if (typeof delta.reasoning_content === 'string') return delta.reasoning_content
   if (typeof delta.reasoning === 'string') return delta.reasoning
   return ''
 }
 
-function finishCalls(calls: Map<number, GeminiCall>): { ok: true; calls: FunctionCall[] } | { ok: false; error: string } {
-  const ordered = [...calls.entries()].sort((left, right) => left[0] - right[0]).map((entry) => entry[1])
+function orderedCalls(calls: Map<number, GeminiCall>) {
+  return [...calls.entries()].sort((left, right) => left[0] - right[0]).map((entry) => entry[1])
+}
+
+function finishCalls(calls: readonly GeminiCall[]): { ok: true; calls: FunctionCall[] } | { ok: false; error: string } {
   const result: FunctionCall[] = []
-  for (const call of ordered) {
+  for (const call of calls) {
     if (!call.id || !call.name) return { ok: false, error: 'Вызов инструмента без идентификатора' }
     result.push({ callId: call.id, name: call.name, arguments: call.arguments })
   }
