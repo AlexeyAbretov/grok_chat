@@ -332,6 +332,30 @@ button { cursor: pointer; }
   50% { opacity: 0.45; }
 }
 
+.boot {
+  height: 100dvh;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
+
+.boot div {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+}
+
+.boot p { margin: 0; }
+
+.boot button {
+  border: 0;
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 650;
+}
+
 @media (max-width: 800px) {
   .app { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
   .sidebar { border-right: 0; border-bottom: 1px solid var(--line); overflow: visible; }

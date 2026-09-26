@@ -4,8 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "node --use-env-proxy --env-file=.env scripts/dev.ts",
-    "server": "node server/index.ts",
+    "dev": "node --disable-warning=ExperimentalWarning --use-env-proxy --env-file=.env scripts/dev.ts",
+    "server": "node --disable-warning=ExperimentalWarning server/index.ts",
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.server.json && vite build",
     "preview": "vite preview"
   },

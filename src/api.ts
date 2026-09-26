@@ -1,4 +1,6 @@
+import { parsePersistedState, type PersistedState } from '../shared/state.ts'
 import { applyJson, applySseEvent, errorText, splitSse, type StreamFlags, type StreamHandlers } from '../shared/sse.ts'
+import { clearLegacyState, clearStoredApiKeys, createChat, readLegacyState } from './storage.ts'
 import type { Effort, ProviderInfo } from './types.ts'
 
 export type ChatTurn = {
@@ -108,4 +110,84 @@ export async function streamChat(options: StreamChatOptions) {
 
 export function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === 'AbortError'
+}
+
+let chatsBootstrap: Promise<PersistedState> | null = null
+let saveChain: Promise<void> = Promise.resolve()
+let savedBody = ''
+
+export function resetChatsBootstrap() {
+  chatsBootstrap = null
+}
+
+export function bootstrapChats() {
+  chatsBootstrap ??= loadChats().catch((error: unknown) => {
+    chatsBootstrap = null
+    throw error
+  })
+  return chatsBootstrap
+}
+
+async function loadChats(): Promise<PersistedState> {
+  clearStoredApiKeys()
+  const remote = await fetchChats()
+  const legacy = readLegacyState()
+  if (legacy) {
+    const merged = mergeLegacy(remote, legacy)
+    if (merged) await saveChats(merged)
+    clearLegacyState()
+    if (merged) return merged
+    if (remote.chats.length > 0) return remote
+  }
+  if (remote.chats.length > 0) return remote
+  const chat = createChat()
+  const fresh = { chats: [chat], activeId: chat.id }
+  await saveChats(fresh)
+  return fresh
+}
+
+function mergeLegacy(remote: PersistedState, legacy: PersistedState): PersistedState | null {
+  const known = new Set(remote.chats.map((chat) => chat.id))
+  const extra = legacy.chats.filter((chat) => !known.has(chat.id))
+  if (remote.chats.length === 0) return legacy
+  if (extra.length === 0) return null
+  const activeId = extra.some((chat) => chat.id === legacy.activeId) ? legacy.activeId : remote.activeId
+  return { chats: [...extra, ...remote.chats], activeId }
+}
+
+async function fetchChats(): Promise<PersistedState> {
+  const response = await fetch('/api/chats')
+  if (!response.ok) throw new Error('Не удалось загрузить чаты')
+  const parsed = parsePersistedState(await response.json())
+  if (!parsed.ok) throw new Error(parsed.message)
+  return parsed.state
+}
+
+export function saveChats(state: PersistedState) {
+  const body = JSON.stringify(state)
+  if (body === savedBody) return Promise.resolve()
+  const run = saveChain.then(async () => {
+    if (body === savedBody) return
+    const response = await fetch('/api/chats', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+      keepalive: body.length <= 60_000,
+    })
+    if (!response.ok) {
+      let message = `Ошибка ${response.status}`
+      try {
+        message = errorText(await response.json()) ?? message
+      } catch {
+        // The body was not JSON; the status line is enough.
+      }
+      throw new Error(message)
+    }
+    savedBody = body
+  })
+  saveChain = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  return run
 }

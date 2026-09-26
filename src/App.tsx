@@ -1,26 +1,75 @@
 import { useEffect, useRef, useState } from 'react'
-import { fetchProviders, isAbortError, streamChat, type ChatTurn } from './api.ts'
+import { bootstrapChats, fetchProviders, isAbortError, resetChatsBootstrap, saveChats, streamChat, type ChatTurn } from './api.ts'
 import { Composer } from './components/Composer.tsx'
 import { Sidebar } from './components/Sidebar.tsx'
 import { Thread } from './components/Thread.tsx'
 import { formatTokens, formatUsdFromTicks } from './format.ts'
-import { createChat, createMessage, loadState, saveState, titleFrom } from './storage.ts'
-import { EFFORTS, MAX_TOKEN_OPTIONS, type Chat, type ChatMessage, type Effort, type ProviderInfo } from './types.ts'
+import { createChat, createMessage, titleFrom } from './storage.ts'
+import { EFFORTS, MAX_TOKEN_OPTIONS, type Chat, type ChatMessage, type Effort, type PersistedState, type ProviderInfo } from './types.ts'
 
 export function App() {
-  const [initial] = useState(loadState)
-  const [chats, setChats] = useState<Chat[]>(initial.chats)
-  const [activeId, setActiveId] = useState(initial.activeId)
+  const [chats, setChats] = useState<Chat[]>([])
+  const [activeId, setActiveId] = useState('')
+  const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [attempt, setAttempt] = useState(0)
   const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [streamingChatId, setStreamingChatId] = useState<string | null>(null)
   const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const latestRef = useRef<PersistedState | null>(null)
+  const saveTimerRef = useRef<number | null>(null)
 
   const active = chats.find((chat) => chat.id === activeId) ?? chats[0]
+  latestRef.current = status === 'ready' && active ? { chats, activeId: active.id } : null
 
   useEffect(() => {
-    saveState({ chats, activeId: active.id })
-  }, [chats, active])
+    let cancelled = false
+    bootstrapChats()
+      .then((state) => {
+        if (cancelled) return
+        setChats(state.chats)
+        setActiveId(state.activeId)
+        setStatus('ready')
+      })
+      .catch(() => {
+        if (!cancelled) setStatus('error')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [attempt])
+
+  useEffect(() => {
+    if (status !== 'ready' || !active) return
+    if (saveTimerRef.current !== null) return
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = null
+      const snapshot = latestRef.current
+      if (!snapshot) return
+      void saveChats(snapshot).catch((error: unknown) => {
+        console.error(error)
+      })
+    }, 300)
+  }, [status, chats, activeId, active])
+
+  useEffect(() => {
+    const flush = () => {
+      const snapshot = latestRef.current
+      if (!snapshot) return
+      void saveChats(snapshot).catch((error: unknown) => {
+        console.error(error)
+      })
+    }
+    const onHide = () => {
+      if (document.visibilityState === 'hidden') flush()
+    }
+    document.addEventListener('visibilitychange', onHide)
+    window.addEventListener('pagehide', flush)
+    return () => {
+      document.removeEventListener('visibilitychange', onHide)
+      window.removeEventListener('pagehide', flush)
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -37,7 +86,7 @@ export function App() {
   }, [])
 
   useEffect(() => {
-    if (providers.length === 0) return
+    if (status !== 'ready' || providers.length === 0) return
     const known = new Set(providers.flatMap((item) => item.models))
     const fallback = providers[0]?.models[0]
     if (!fallback) return
@@ -45,14 +94,14 @@ export function App() {
       if (prev.every((chat) => known.has(chat.model))) return prev
       return prev.map((chat) => (known.has(chat.model) ? chat : { ...chat, model: fallback }))
     })
-  }, [providers])
+  }, [providers, status])
 
   useEffect(() => {
     return () => abortRef.current?.abort()
   }, [])
 
   function defaultModel() {
-    return providers[0]?.models[0] ?? active.model
+    return providers[0]?.models[0] ?? active?.model ?? ''
   }
 
   function createNewChat() {
@@ -78,6 +127,7 @@ export function App() {
   }
 
   function patchActive(patch: Partial<Pick<Chat, 'model' | 'maxTokens' | 'reasoningEffort' | 'draft'>>) {
+    if (!active) return
     setChats((prev) => prev.map((chat) => (chat.id === active.id ? { ...chat, ...patch } : chat)))
   }
 
@@ -94,6 +144,7 @@ export function App() {
   }
 
   async function send() {
+    if (!active) return
     const text = active.draft.trim()
     if (!text || streamingChatId) return
 
@@ -151,6 +202,32 @@ export function App() {
       setStreamingChatId((current) => (current === chatId ? null : current))
       setStreamingMessageId((current) => (current === assistantMessage.id ? null : current))
     }
+  }
+
+  if (status !== 'ready' || !active) {
+    return (
+      <div className="boot">
+        <div>
+          {status === 'error' ? (
+            <>
+              <p>Не удалось загрузить чаты</p>
+              <button
+                type="button"
+                onClick={() => {
+                  resetChatsBootstrap()
+                  setStatus('loading')
+                  setAttempt((value) => value + 1)
+                }}
+              >
+                Повторить
+              </button>
+            </>
+          ) : (
+            <p>Загрузка чатов…</p>
+          )}
+        </div>
+      </div>
+    )
   }
 
   const provider = findProvider(providers, active.model)

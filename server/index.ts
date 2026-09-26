@@ -3,6 +3,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { parseChatRequest, parseJsonText } from '../shared/json-schema.ts'
+import { parsePersistedState } from '../shared/state.ts'
+import { chatDbPath, closeChatDb, openChatDb, readChats, writeChats } from './store.ts'
 import { createLlmLog } from './llm-log.ts'
 import { llmForModel, providerStatus } from './providers/index.ts'
 import type { ChatInputMessage } from './providers/types.ts'
@@ -11,6 +13,7 @@ import type { Usage } from '../shared/protocol.ts'
 import { addUsage, usageToApi } from './turn.ts'
 
 const MAX_BODY = 2_000_000
+const MAX_CHAT_BODY = 8_000_000
 const PORT = Number(process.env.PORT) || 8787
 const DIST = resolve('dist')
 
@@ -30,6 +33,7 @@ const STATIC_TYPES: Record<string, string> = {
 loadEnvFile()
 
 export function startServer() {
+  openChatDb()
   const server = createServer((req, res) => {
     void handle(req, res).catch((error: unknown) => {
       if (res.writableEnded || res.destroyed) return
@@ -38,7 +42,12 @@ export function startServer() {
     })
   })
 
+  server.on('close', () => {
+    closeChatDb()
+  })
+
   server.on('error', (error: NodeJS.ErrnoException) => {
+    closeChatDb()
     if (error.code === 'EADDRINUSE') {
       console.error(`Порт ${PORT} уже занят`)
     } else {
@@ -50,6 +59,7 @@ export function startServer() {
   return new Promise<Server>((resolveListen) => {
     server.listen(PORT, '127.0.0.1', () => {
       console.log(`API http://127.0.0.1:${PORT}`)
+      console.log(`Чаты ${chatDbPath()}`)
       resolveListen(server)
     })
   })
@@ -69,8 +79,41 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     await handleChat(req, res)
     return
   }
+  if (path === '/api/chats') {
+    await handleChats(req, res)
+    return
+  }
   if (serveStatic(req, res)) return
   writeJson(res, 404, { error: { message: 'Не найдено' } })
+}
+
+async function handleChats(req: IncomingMessage, res: ServerResponse) {
+  if (req.method === 'GET') {
+    writeJson(res, 200, readChats())
+    return
+  }
+  if (req.method !== 'PUT') {
+    writeJson(res, 405, { error: { message: 'Метод не поддерживается' } })
+    return
+  }
+
+  const raw = await readBody(req, MAX_CHAT_BODY)
+  const parsed = parseJsonText(raw)
+  if (!parsed.ok) {
+    writeJson(res, 400, { error: { message: parsed.reason === 'truncated' ? 'JSON обрезан' : 'Некорректный JSON' } })
+    return
+  }
+  const state = parsePersistedState(parsed.value)
+  if (!state.ok) {
+    writeJson(res, 400, { error: { message: state.message } })
+    return
+  }
+  if (state.state.chats.length === 0) {
+    writeJson(res, 400, { error: { message: 'Нужен хотя бы один чат' } })
+    return
+  }
+  writeChats(state.state)
+  writeJson(res, 200, { ok: true })
 }
 
 async function handleChat(req: IncomingMessage, res: ServerResponse) {
@@ -245,14 +288,14 @@ function normalizeKey(raw: string) {
   return trimmed.toLowerCase().startsWith('bearer ') ? trimmed.slice(7).trim() : trimmed
 }
 
-function readBody(req: IncomingMessage) {
+function readBody(req: IncomingMessage, max = MAX_BODY) {
   return new Promise<string>((resolveBody, reject) => {
     const chunks: Buffer[] = []
     let size = 0
     req.on('data', (chunk: Buffer | string) => {
       const buffer = typeof chunk === 'string' ? Buffer.from(chunk) : chunk
       size += buffer.length
-      if (size > MAX_BODY) {
+      if (size > max) {
         reject(new Error('Слишком длинный запрос'))
         req.destroy()
         return
