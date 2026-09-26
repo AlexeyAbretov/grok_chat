@@ -161,18 +161,22 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
   let failed: string | null = null
   let failureStatus = 502
   let noticeReason: string | null = null
+  let offerTools = true
+  let toolRounds = 0
+  let turnIndex = 0
 
   try {
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+    while (toolRounds < MAX_TOOL_ROUNDS) {
       if (upstreamAbort.signal.aborted || res.destroyed) return
-      if (round > 0) llm.line(`→ раунд ${round + 1}`)
+      turnIndex += 1
+      if (turnIndex > 1) llm.line(`→ раунд ${turnIndex}`)
 
       const turn = await provider.streamTurn({
         apiKey,
         model,
         messages: input,
         transcript,
-        tools: TOOLS,
+        tools: offerTools ? TOOLS : [],
         maxTokens,
         reasoningEffort,
         signal: upstreamAbort.signal,
@@ -194,14 +198,14 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
         break
       }
       usage = addUsage(usage, turn.usage)
-      llm.turn(round + 1, turn.output, turn.failed, turn.incompleteReason, turn.usage)
+      llm.turn(turnIndex, turn.output, turn.failed, turn.incompleteReason, turn.usage)
       if (turn.failed) {
         failed = turn.failed
         break
       }
       const plan = planToolRound(turn)
-      if (plan.action !== 'tools') {
-        noticeReason = plan.noticeReason
+      if (!offerTools || plan.action !== 'tools') {
+        noticeReason = plan.action === 'tools' ? null : plan.noticeReason
         break
       }
 
@@ -214,7 +218,6 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
         noticeReason = ''
         break
       }
-      if (tools.stop === 'tool') break
 
       transcript = [
         ...transcript,
@@ -222,7 +225,13 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
         ...provider.toolOutputs(tools.executed.map((item) => ({ callId: item.callId, ok: item.ok, output: item.output }))),
       ]
 
-      if (round === MAX_TOOL_ROUNDS - 1) noticeReason = 'max_tool_rounds'
+      if (tools.stop === 'tool') {
+        offerTools = false
+        continue
+      }
+
+      toolRounds += 1
+      if (toolRounds === MAX_TOOL_ROUNDS) noticeReason = 'max_tool_rounds'
     }
 
     if (upstreamAbort.signal.aborted || res.destroyed) return

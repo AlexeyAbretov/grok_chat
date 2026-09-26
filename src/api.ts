@@ -8,6 +8,38 @@ export type ChatTurn = {
   content: string
 }
 
+type HistoryMessage = {
+  role: 'user' | 'assistant'
+  content: string
+  tools?: readonly { name: string; args?: string; ok: boolean; output: string }[]
+}
+
+export function modelHistory(messages: readonly HistoryMessage[]): ChatTurn[] {
+  const turns: ChatTurn[] = []
+  for (const message of messages) {
+    if (message.role === 'user') {
+      turns.push({ role: 'user', content: message.content })
+      continue
+    }
+    if (message.content.trim()) {
+      turns.push({ role: 'assistant', content: message.content })
+      continue
+    }
+    const tools = message.tools ?? []
+    if (tools.length === 0) continue
+    turns.push({
+      role: 'assistant',
+      content: tools
+        .map((tool) => {
+          const args = tool.args ? ` ${tool.args}` : ''
+          return tool.ok ? `${tool.name}${args}: ${tool.output}` : `${tool.name}${args}: ошибка: ${tool.output}`
+        })
+        .join('\n'),
+    })
+  }
+  return turns
+}
+
 type StreamChatOptions = Omit<StreamHandlers, 'onError'> & {
   chatId: string
   model: string

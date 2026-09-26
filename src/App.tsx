@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { bootstrapChats, fetchProviders, isAbortError, resetChatsBootstrap, saveChats, streamChat, type ChatTurn } from './api.ts'
+import { bootstrapChats, fetchProviders, isAbortError, modelHistory, resetChatsBootstrap, saveChats, streamChat } from './api.ts'
 import { Composer } from './components/Composer.tsx'
 import { Sidebar } from './components/Sidebar.tsx'
 import { Thread } from './components/Thread.tsx'
@@ -151,12 +151,7 @@ export function App() {
     const chatId = active.id
     const userMessage = createMessage('user', text)
     const assistantMessage = createMessage('assistant', '')
-    const history: ChatTurn[] = [
-      ...active.messages
-        .filter((message) => message.role === 'user' || message.content.trim())
-        .map((message) => ({ role: message.role, content: message.content })),
-      { role: 'user', content: text },
-    ]
+    const history = [...modelHistory(active.messages), { role: 'user' as const, content: text }]
 
     setChats((prev) =>
       prev.map((chat) => {

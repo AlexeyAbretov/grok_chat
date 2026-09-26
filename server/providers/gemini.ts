@@ -39,18 +39,7 @@ async function streamTurn(request: ProviderTurnRequest): Promise<StreamTurnResul
       'Content-Type': 'application/json',
       Authorization: `Bearer ${request.apiKey}`,
     },
-    body: JSON.stringify({
-      model: request.model,
-      messages: joinGeminiMessages([...request.messages, ...request.transcript]),
-      tools: chatTools(request.tools),
-      tool_choice: 'auto',
-      max_tokens: request.maxTokens,
-      stream_options: { include_usage: true },
-      extra_body: {
-        google: { thinking_config: { include_thoughts: true, thinking_level: effort } },
-      },
-      stream: true,
-    }),
+    body: JSON.stringify(geminiBody(request, effort)),
     signal: request.signal,
   })
 
@@ -82,6 +71,24 @@ export function joinGeminiMessages(messages: readonly unknown[]) {
     joined.push(message)
   }
   return joined
+}
+
+function geminiBody(request: ProviderTurnRequest, effort: string) {
+  const body: Record<string, unknown> = {
+    model: request.model,
+    messages: joinGeminiMessages([...request.messages, ...request.transcript]),
+    max_tokens: request.maxTokens,
+    stream_options: { include_usage: true },
+    extra_body: {
+      google: { thinking_config: { include_thoughts: true, thinking_level: effort } },
+    },
+    stream: true,
+  }
+  if (request.tools.length > 0) {
+    body.tools = chatTools(request.tools)
+    body.tool_choice = 'auto'
+  }
+  return body
 }
 
 function chatTools(tools: readonly object[]) {

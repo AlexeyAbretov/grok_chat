@@ -5,6 +5,7 @@ import { locateNote, runTool, type ToolIo } from '../server/tools.ts'
 import { claudeToolPayload } from '../server/providers/claude.ts'
 import { consumeGeminiText, geminiTextCall, geminiThoughtSignature, geminiToolCall, joinGeminiMessages } from '../server/providers/gemini.ts'
 import { addUsage, consumeTurn, executeToolCalls, planToolRound } from '../server/turn.ts'
+import { modelHistory } from '../src/api.ts'
 
 function assert(condition: unknown, message: string) {
   if (!condition) throw new Error(message)
@@ -209,6 +210,17 @@ const zeroRound = executeToolCalls(
   },
 )
 assert(zeroRound.stop === 'tool' && toolRuns === 1 && zeroRound.executed[0]?.output === 'Деление на ноль', 'a tool error stops the round')
+
+const kept = modelHistory([
+  { role: 'user', content: '2 / 0' },
+  { role: 'assistant', content: '', tools: [{ name: 'calculator', args: '{"op":"div","a":2,"b":0}', ok: false, output: 'Деление на ноль' }] },
+  { role: 'user', content: 'привет' },
+])
+assert(
+  kept.length === 3 && kept[1]?.role === 'assistant' && kept[1].content.includes('Деление на ноль'),
+  'a failed tool stays in the next prompt',
+)
+assert(modelHistory([{ role: 'assistant', content: '   ', tools: [] }]).length === 0, 'an empty assistant turn is omitted')
 
 const cutPayload = claudeToolPayload('{"op":"div"')
 assert(cutPayload.arguments === '{"op":"div"' && typeof cutPayload.input === 'string', 'truncated Claude tool json is not replaced with {}')

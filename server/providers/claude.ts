@@ -53,7 +53,7 @@ async function streamTurn(request: ProviderTurnRequest): Promise<StreamTurnResul
       max_tokens: request.maxTokens,
       system: shaped.system,
       messages: shaped.messages,
-      tools: claudeTools(request.tools),
+      ...(request.tools.length > 0 ? { tools: claudeTools(request.tools) } : {}),
       thinking: { type: 'adaptive' },
       output_config: { effort: request.reasoningEffort },
       stream: true,

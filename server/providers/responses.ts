@@ -55,7 +55,7 @@ async function streamResponsesTurn(config: ResponsesProviderConfig, request: Pro
     body: JSON.stringify({
       model: request.model,
       input: [...request.messages, ...request.transcript],
-      tools: request.tools,
+      ...(request.tools.length > 0 ? { tools: request.tools } : {}),
       max_output_tokens: request.maxTokens,
       ...(effort ? { reasoning: { effort } } : {}),
       stream: true,
