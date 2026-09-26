@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, unlinkSync } from 'node:fs'
 import { relative, resolve, sep } from 'node:path'
-import { agentBlock, createAgentState, MAX_COST_TICKS, MAX_TOOL_ROUNDS, modelStepRecord, runAgentTools } from '../server/agent.ts'
+import { agentBlock, answerText, apiErrorRecord, blockedStepRecord, createAgentState, finishStop, MAX_COST_TICKS, MAX_COST_TOKENS, MAX_TOOL_ROUNDS, modelStepRecord, runAgentTools } from '../server/agent.ts'
 import { createLlmLog, formatLlmItem, llmLogPath, llmTracePath } from '../server/llm-log.ts'
 import { chatTools, locateNote, runTool, type ToolIo } from '../server/tools.ts'
 import { claudeToolPayload } from '../server/providers/claude.ts'
@@ -245,10 +245,13 @@ assert(longRow?.latency_ms === 33 && longRow.cost_ticks === 11 && longRow.step =
 assert(longRow?.input_tokens === 4 && longRow.total_tokens === 9, 'a step record has the turn tokens')
 const plainAgent = createAgentState('grok-test', 'req-plain')
 plainAgent.step = 1
-chatLog.step(modelStepRecord(plainAgent, 15, { inputTokens: 1, outputTokens: 2, reasoningTokens: null, cachedTokens: null, totalTokens: 3, costTicks: 10 }))
+chatLog.step(
+  modelStepRecord(plainAgent, 15, { inputTokens: 1, outputTokens: 2, reasoningTokens: null, cachedTokens: null, totalTokens: 3, costTicks: 10 }, 'Готово', null),
+)
 const plainLines = traceFile ? readFileSync(traceFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>) : []
 const plainRow = plainLines.find((row) => row.request_id === 'req-plain')
 assert(plainRow?.tool === null && plainRow.arguments === null && plainRow.output === null, 'a round without tools still writes a step record')
+assert(plainRow?.text === 'Готово', 'a plain step record keeps the answer text')
 assert(plainRow?.latency_ms === 15 && plainRow.cost_ticks === 10, 'a plain step record keeps latency and cost')
 if (logFile) unlinkSync(logFile)
 if (traceFile && existsSync(traceFile)) unlinkSync(traceFile)
@@ -290,12 +293,13 @@ assert(zeroRound.stop === 'tool' && toolRuns === 1 && zeroRound.executed[0]?.out
 let searches = 0
 const searchAgent = createAgentState('grok-test', 'req-search')
 searchAgent.step = 1
+const city = runTool('search_notes', { query: 'город' })
 const firstSearch = runAgentTools(
   searchAgent,
   [{ callId: '1', name: 'search_notes', arguments: '{"query":"город"}' }],
   () => {
     searches += 1
-    return { ok: true, output: '{"matches":[]}' }
+    return city
   },
   20,
   null,
@@ -305,7 +309,7 @@ const repeatSearch = runAgentTools(
   [{ callId: '2', name: 'search_notes', arguments: '{ "query" : "город" }' }],
   () => {
     searches += 1
-    return { ok: true, output: '{"matches":[]}' }
+    return city
   },
   21,
   null,
@@ -367,6 +371,80 @@ const zeroStop = runAgentTools(
   null,
 )
 assert(zeroStop.stop === 'tool' && zeroStop.records[0]?.stop === null, 'division by zero stays a tool error')
+
+const pairAgent = createAgentState('grok-test', 'req-pair')
+pairAgent.step = 1
+const pairUsage = { inputTokens: 9, outputTokens: 8, reasoningTokens: null, cachedTokens: null, totalTokens: 17, costTicks: 40 }
+const paired = runAgentTools(
+  pairAgent,
+  [
+    { callId: '1', name: 'calculator', arguments: '{"op":"add","a":2,"b":3}' },
+    { callId: '2', name: 'calculator', arguments: '{"op":"sub","a":5,"b":1}' },
+  ],
+  (name, args) => runTool(name, args),
+  40,
+  pairUsage,
+  'считаю',
+)
+const firstBill = paired.records[0]
+const secondBill = paired.records[1]
+if (!firstBill || !secondBill) throw new Error('both tool calls are recorded')
+assert(paired.stop === null && firstBill.output === '{"result":5}' && secondBill.output === '{"result":4}', 'two tools in one answer both run')
+assert(firstBill.cost_ticks === 40 && firstBill.latency_ms === 40 && firstBill.text === 'считаю', 'the turn cost stays on the first call')
+assert(secondBill.cost_ticks === null && secondBill.latency_ms === null && secondBill.input_tokens === null && secondBill.text === null, 'a second call in the same answer does not repeat the turn cost')
+
+const fileLiar = createAgentState('grok-test', 'req-file')
+fileLiar.step = 1
+const fileLie = runAgentTools(
+  fileLiar,
+  [{ callId: '1', name: 'read_file', arguments: '{"path":"a.md"}' }],
+  () => ({ ok: true, output: '{"path":"a.md","content":"нет такого","truncated":false}' }),
+  3,
+  null,
+)
+assert(fileLie.stop === 'tool_mismatch' && fileLie.records[0]?.ok === true, 'a false file read stops the step')
+
+const fileHonest = createAgentState('grok-test', 'req-file-ok')
+fileHonest.step = 1
+const fileOk = runAgentTools(
+  fileHonest,
+  [{ callId: '1', name: 'read_file', arguments: '{"path":"a.md"}' }],
+  (name, args) => runTool(name, args),
+  3,
+  null,
+)
+assert(fileOk.stop === null && fileOk.executed[0]?.output.includes('Калькулятор'), 'a true file read continues')
+
+const searchLiar = createAgentState('grok-test', 'req-search-lie')
+searchLiar.step = 1
+const searchLie = runAgentTools(
+  searchLiar,
+  [{ callId: '1', name: 'search_notes', arguments: '{"query":"Калькулятор"}' }],
+  () => ({ ok: true, output: '{"matches":[],"truncated":false}' }),
+  3,
+  null,
+)
+assert(searchLie.stop === 'tool_mismatch', 'a false search result stops the step')
+
+assert(answerText([{ type: 'message', content: [{ type: 'output_text', text: '  итог  ' }] }]) === 'итог', 'a response message keeps its text')
+assert(answerText([{ role: 'assistant', content: 'Привет' }]) === 'Привет', 'a plain assistant message keeps its text')
+assert(
+  answerText([{ role: 'assistant', content: [{ type: 'text', text: 'да' }, { type: 'thinking', thinking: 'скрыто' }] }]) === 'да',
+  'thinking is not the answer text',
+)
+assert(finishStop('truncated', 'max_output_tokens') === 'max_output_tokens', 'a cut answer keeps its stop reason')
+assert(finishStop('truncated', '') === 'truncated', 'a cut answer without a reason still has a stop')
+assert(finishStop('finish', null) === null, 'a finished answer is not a stop')
+
+const apiError = apiErrorRecord(createAgentState('grok-test', 'req-api'), 12, null, 'Сервис недоступен')
+assert(apiError.stop === 'api_error' && apiError.text === 'Сервис недоступен' && apiError.latency_ms === 12, 'an API error keeps its message and stop')
+const refused = blockedStepRecord(createAgentState('grok-test', 'req-stop'), 'max_cost')
+assert(refused.stop === 'max_cost' && refused.step === 1 && refused.cost_ticks === null && refused.text === null, 'a budget stop is its own step record')
+const unpriced = createAgentState('grok-test', 'req-tokens')
+unpriced.usage = { inputTokens: 1, outputTokens: 1, reasoningTokens: null, cachedTokens: null, totalTokens: MAX_COST_TOKENS, costTicks: null }
+assert(agentBlock(unpriced) === 'max_cost', 'a provider without a price still stops on tokens')
+unpriced.usage = { ...unpriced.usage, totalTokens: MAX_COST_TOKENS - 1 }
+assert(agentBlock(unpriced) === null, 'token spend under the cap still continues')
 
 const budget = createAgentState('grok-test', 'req-budget')
 assert(agentBlock(budget) === null, 'a new request is under budget')

@@ -9,7 +9,7 @@ import { createLlmLog } from './llm-log.ts'
 import { llmForModel, providerStatus } from './providers/index.ts'
 import type { ChatInputMessage } from './providers/types.ts'
 import { chatTools, noteNames, runTool } from './tools.ts'
-import { agentBlock, createAgentState, MAX_COST_TICKS, modelStepRecord, runAgentTools } from './agent.ts'
+import { agentBlock, answerText, apiErrorRecord, blockedStepRecord, createAgentState, finishStop, MAX_COST_TICKS, modelStepRecord, runAgentTools } from './agent.ts'
 import { addUsage, planToolRound, usageToApi } from './turn.ts'
 
 const MAX_BODY = 2_000_000
@@ -171,6 +171,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
       const blocked = agentBlock(agent)
       if (blocked) {
         noticeReason = blocked
+        llm.step(blockedStepRecord(agent, blocked))
         break
       }
       agent.step += 1
@@ -202,24 +203,26 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
         failed = turn.failed
         failureStatus = turn.httpStatus || 502
         llm.line(`← HTTP ${failureStatus}: ${failed}`)
-        llm.step(modelStepRecord(agent, latencyMs, turn.usage))
+        llm.step(apiErrorRecord(agent, latencyMs, turn.usage, failed))
         break
       }
       agent.usage = addUsage(agent.usage, turn.usage)
       llm.turn(agent.step, turn.output, turn.failed, turn.incompleteReason, turn.usage, latencyMs)
       if (turn.failed) {
         failed = turn.failed
-        llm.step(modelStepRecord(agent, latencyMs, turn.usage))
+        llm.step(apiErrorRecord(agent, latencyMs, turn.usage, failed))
         break
       }
       const plan = planToolRound(turn)
+      const text = answerText(turn.output)
       if (!offerTools || plan.action !== 'tools') {
-        llm.step(modelStepRecord(agent, latencyMs, turn.usage))
-        noticeReason = plan.action === 'tools' ? null : plan.noticeReason
+        const notice = plan.action === 'tools' ? null : plan.noticeReason
+        llm.step(modelStepRecord(agent, latencyMs, turn.usage, text, finishStop(plan.action, notice)))
+        noticeReason = notice
         break
       }
 
-      const tools = runAgentTools(agent, turn.calls, (name, args) => runTool(name, args), latencyMs, turn.usage)
+      const tools = runAgentTools(agent, turn.calls, (name, args) => runTool(name, args), latencyMs, turn.usage, text)
       for (const item of tools.executed) {
         await writeSse(res, { type: 'tool', name: item.name, args: preview(item.arguments), ok: item.ok, output: preview(item.output) })
         llm.tool(item.name, item.ok, item.output)
@@ -268,8 +271,9 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
     res.end()
   } catch (error) {
     if (upstreamAbort.signal.aborted || res.destroyed) return
-    if (!streaming) throw error
     const message = error instanceof Error ? error.message : 'Внутренняя ошибка'
+    llm.step(apiErrorRecord(agent, null, agent.usage, message))
+    if (!streaming) throw error
     await writeSse(res, { type: 'error', error: { message } })
     if (!res.writableEnded) res.end()
   }

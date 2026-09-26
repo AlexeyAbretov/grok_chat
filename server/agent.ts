@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { parseJsonText } from '../shared/json-schema.ts'
 import type { Usage } from '../shared/protocol.ts'
+import { extractOutput } from '../shared/sse.ts'
+import { runTool } from './tools.ts'
 import type { ExecutedTool, FunctionCall } from './turn.ts'
 
 const TICKS_PER_USD = 10_000_000_000
@@ -9,6 +11,8 @@ const CALC_OPS = ['add', 'sub', 'mul', 'div'] as const
 export const MAX_TOOL_ROUNDS = 5
 /** $0.25 for one user message. The loop checks this before the next model call. */
 export const MAX_COST_TICKS = TICKS_PER_USD / 4
+/** Used when the provider does not report a price. Same stop as the dollar cap. */
+export const MAX_COST_TOKENS = 200_000
 
 export type AgentCall = {
   name: string
@@ -32,11 +36,12 @@ export type StepRecord = {
   arguments: string | null
   output: string | null
   ok: boolean | null
-  latency_ms: number
+  latency_ms: number | null
   input_tokens: number | null
   output_tokens: number | null
   total_tokens: number | null
   cost_ticks: number | null
+  text: string | null
   stop: string | null
 }
 
@@ -53,13 +58,46 @@ export function createAgentState(model: string, requestId: string = randomUUID()
   }
 }
 
-export function modelStepRecord(agent: AgentState, latencyMs: number, turnUsage: Usage | null): StepRecord {
-  return stepRecord(agent, null, null, null, null, latencyMs, turnUsage, null)
+export function modelStepRecord(
+  agent: AgentState,
+  latencyMs: number | null,
+  turnUsage: Usage | null,
+  text: string | null = null,
+  stop: string | null = null,
+): StepRecord {
+  return stepRecord(agent, null, null, null, null, latencyMs, turnUsage, stop, text)
+}
+
+export function apiErrorRecord(agent: AgentState, latencyMs: number | null, turnUsage: Usage | null, message: string): StepRecord {
+  return modelStepRecord(agent, latencyMs, turnUsage, message, 'api_error')
+}
+
+export function blockedStepRecord(agent: AgentState, stop: string): StepRecord {
+  return stepRecord({ ...agent, step: agent.step + 1 }, null, null, null, null, null, null, stop, null)
+}
+
+export function finishStop(action: 'finish' | 'truncated' | 'tools', noticeReason: string | null): string | null {
+  if (action !== 'truncated') return null
+  return noticeReason || 'truncated'
+}
+
+export function answerText(output: readonly unknown[]): string | null {
+  const fromMessage = extractOutput({ output: [...output] }).text
+  let text = fromMessage
+  for (const item of output) {
+    const record = asRecord(item)
+    if (!record || record.role !== 'assistant' || record.type === 'message') continue
+    text += textOf(record.content)
+  }
+  const trimmed = text.trim()
+  return trimmed || null
 }
 
 export function agentBlock(agent: AgentState): 'max_cost' | 'max_tool_rounds' | null {
   if (agent.toolRounds >= MAX_TOOL_ROUNDS) return 'max_tool_rounds'
-  if (agent.usage?.costTicks != null && agent.usage.costTicks >= MAX_COST_TICKS) return 'max_cost'
+  const cost = agent.usage?.costTicks
+  if (cost != null && cost >= MAX_COST_TICKS) return 'max_cost'
+  if (cost == null && (agent.usage?.totalTokens ?? 0) >= MAX_COST_TOKENS) return 'max_cost'
   return null
 }
 
@@ -69,14 +107,26 @@ export function runAgentTools(
   run: (name: string, args: unknown) => { ok: boolean; output: string },
   latencyMs: number,
   turnUsage: Usage | null,
+  text: string | null = null,
 ): { stop: AgentToolStop; executed: ExecutedTool[]; records: StepRecord[] } {
   const executed: ExecutedTool[] = []
   const records: StepRecord[] = []
+  let charged = false
+  const charge = () => {
+    if (charged) return { latency: null, usage: null, text: null }
+    charged = true
+    return { latency: latencyMs, usage: turnUsage, text }
+  }
   for (const call of calls) {
     const parsed = parseJsonText(call.arguments)
-    if (!parsed.ok) return { stop: 'truncated', executed, records }
+    if (!parsed.ok) {
+      const billed = charge()
+      records.push(stepRecord(agent, call.name, call.arguments, null, null, billed.latency, billed.usage, 'truncated', billed.text))
+      return { stop: 'truncated', executed, records }
+    }
     if (repeatedCall(agent, call.name, call.arguments)) {
-      records.push(stepRecord(agent, call.name, call.arguments, null, null, latencyMs, turnUsage, 'duplicate_tool'))
+      const billed = charge()
+      records.push(stepRecord(agent, call.name, call.arguments, null, null, billed.latency, billed.usage, 'duplicate_tool', billed.text))
       return { stop: 'duplicate_tool', executed, records }
     }
     const result = run(call.name, parsed.value)
@@ -88,8 +138,21 @@ export function runAgentTools(
       ok: result.ok,
       output: result.output,
     })
-    const mismatch = result.ok && call.name === 'calculator' && !calculatorAgrees(parsed.value, result.output)
-    records.push(stepRecord(agent, call.name, call.arguments, result.output, result.ok, latencyMs, turnUsage, mismatch ? 'tool_mismatch' : null))
+    const mismatch = result.ok && !toolAgrees(call.name, parsed.value, result.output)
+    const billed = charge()
+    records.push(
+      stepRecord(
+        agent,
+        call.name,
+        call.arguments,
+        result.output,
+        result.ok,
+        billed.latency,
+        billed.usage,
+        mismatch ? 'tool_mismatch' : null,
+        billed.text,
+      ),
+    )
     if (!result.ok) return { stop: 'tool', executed, records }
     if (mismatch) return { stop: 'tool_mismatch', executed, records }
   }
@@ -114,9 +177,10 @@ function stepRecord(
   argsText: string | null,
   output: string | null,
   ok: boolean | null,
-  latencyMs: number,
+  latencyMs: number | null,
   turnUsage: Usage | null,
   stop: string | null,
+  text: string | null,
 ): StepRecord {
   return {
     request_id: agent.requestId,
@@ -131,8 +195,36 @@ function stepRecord(
     output_tokens: turnUsage?.outputTokens ?? null,
     total_tokens: turnUsage?.totalTokens ?? null,
     cost_ticks: turnUsage?.costTicks ?? null,
+    text,
     stop,
   }
+}
+
+function toolAgrees(name: string, args: unknown, output: string) {
+  if (name === 'calculator') return calculatorAgrees(args, output)
+  if (name !== 'read_file' && name !== 'search_notes') return true
+  const expected = runTool(name, args)
+  if (!expected.ok) return false
+  return canonicalArguments(expected.output) === canonicalArguments(output)
+}
+
+function textOf(content: unknown) {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  let text = ''
+  for (const part of content) {
+    const record = asRecord(part)
+    if (!record) continue
+    const type = typeof record.type === 'string' ? record.type : ''
+    if (type === 'thinking' || type === 'tool_use') continue
+    if (typeof record.text === 'string') text += record.text
+  }
+  return text
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>
+  return null
 }
 
 function canonicalArguments(text: string) {
