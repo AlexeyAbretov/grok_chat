@@ -9,8 +9,9 @@ import { createLlmLog } from './llm-log.ts'
 import { llmForModel, providerStatus } from './providers/index.ts'
 import type { ChatInputMessage } from './providers/types.ts'
 import { chatTools, noteNames, runTool } from './tools.ts'
-import { agentBlock, answerText, apiErrorRecord, blockedStepRecord, createAgentState, finishStop, MAX_COST_TICKS, modelStepRecord, runAgentTools } from './agent.ts'
-import { addUsage, planToolRound, usageToApi } from './turn.ts'
+import { apiErrorRecord, MAX_COST_TICKS } from './agent.ts'
+import { agentGraph, createAgentRun } from './agent-graph.ts'
+import { usageToApi } from './turn.ts'
 
 const MAX_BODY = 2_000_000
 const MAX_CHAT_BODY = 8_000_000
@@ -143,7 +144,6 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
   }
 
   const input: ChatInputMessage[] = [{ role: 'system', content: provider.systemPrompt }, ...messages]
-  let transcript: unknown[] = []
   const llm = createLlmLog(chatId)
   llm.line(`файл logs/${chatId}.log`)
   const offered = chatTools()
@@ -158,112 +158,69 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
   })
 
   let streaming = false
-  let failed: string | null = null
-  let failureStatus = 502
-  let noticeReason: string | null = null
-  let offerTools = true
-  const agent = createAgentState(model)
-  llm.line(`запрос ${agent.requestId}, бюджет ${MAX_COST_TICKS} тиков`)
+  const run = createAgentRun(model)
+  let observed = run
+  llm.line(`запрос ${run.requestId}, бюджет ${MAX_COST_TICKS} тиков`)
 
   try {
-    while (true) {
-      if (upstreamAbort.signal.aborted || res.destroyed) return
-      const blocked = agentBlock(agent)
-      if (blocked) {
-        noticeReason = blocked
-        llm.step(blockedStepRecord(agent, blocked))
-        break
-      }
-      agent.step += 1
-      if (agent.step > 1) llm.line(`→ раунд ${agent.step}`)
-
-      const started = performance.now()
-      const turn = await provider.streamTurn({
-        apiKey,
-        model,
-        messages: input,
-        transcript,
-        tools: offerTools ? offered : [],
-        maxTokens,
-        reasoningEffort,
+    const result = await agentGraph.invoke(run, {
+      threadId: run.requestId,
+      deps: {
         signal: upstreamAbort.signal,
-        beginStream: () => {
-          if (streaming) return
-          streaming = true
-          res.statusCode = 200
-          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
-          res.setHeader('Cache-Control', 'no-cache, no-transform')
-          res.setHeader('X-Accel-Buffering', 'no')
+        observe: (state) => {
+          observed = state
         },
-        emit: (event) => writeSse(res, event),
-      })
-      if (upstreamAbort.signal.aborted || res.destroyed) return
-      const latencyMs = Math.round(performance.now() - started)
-      if (turn.failed && !streaming) {
-        failed = turn.failed
-        failureStatus = turn.httpStatus || 502
-        llm.line(`← HTTP ${failureStatus}: ${failed}`)
-        llm.step(apiErrorRecord(agent, latencyMs, turn.usage, failed))
-        break
-      }
-      agent.usage = addUsage(agent.usage, turn.usage)
-      llm.turn(agent.step, turn.output, turn.failed, turn.incompleteReason, turn.usage, latencyMs)
-      if (turn.failed) {
-        failed = turn.failed
-        llm.step(apiErrorRecord(agent, latencyMs, turn.usage, failed))
-        break
-      }
-      const plan = planToolRound(turn)
-      const text = answerText(turn.output)
-      if (!offerTools || plan.action !== 'tools') {
-        const notice = plan.action === 'tools' ? null : plan.noticeReason
-        llm.step(modelStepRecord(agent, latencyMs, turn.usage, text, finishStop(plan.action, notice)))
-        noticeReason = notice
-        break
-      }
-
-      const tools = runAgentTools(agent, turn.calls, (name, args) => runTool(name, args), latencyMs, turn.usage, text)
-      for (const item of tools.executed) {
-        await writeSse(res, { type: 'tool', name: item.name, args: preview(item.arguments), ok: item.ok, output: preview(item.output) })
-        llm.tool(item.name, item.ok, item.output)
-      }
-      for (const record of tools.records) llm.step(record)
-      if (tools.stop === 'truncated') {
-        noticeReason = ''
-        break
-      }
-      if (tools.stop === 'duplicate_tool' || tools.stop === 'tool_mismatch') {
-        noticeReason = tools.stop
-        break
-      }
-
-      transcript = [
-        ...transcript,
-        ...turn.output,
-        ...provider.toolOutputs(tools.executed.map((item) => ({ callId: item.callId, ok: item.ok, output: item.output }))),
-      ]
-
-      if (tools.stop === 'tool') {
-        offerTools = false
-        continue
-      }
-
-      agent.toolRounds += 1
-    }
-
-    if (upstreamAbort.signal.aborted || res.destroyed) return
+        callModel: async (state) => {
+          let startedStream = state.streaming
+          const started = performance.now()
+          const turn = await provider.streamTurn({
+            apiKey,
+            model,
+            messages: input,
+            transcript: state.transcript,
+            tools: state.offerTools ? offered : [],
+            maxTokens,
+            reasoningEffort,
+            signal: upstreamAbort.signal,
+            beginStream: () => {
+              startedStream = true
+              if (streaming) return
+              streaming = true
+              res.statusCode = 200
+              res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+              res.setHeader('Cache-Control', 'no-cache, no-transform')
+              res.setHeader('X-Accel-Buffering', 'no')
+            },
+            emit: (event) => writeSse(res, event),
+          })
+          return { turn, latencyMs: Math.round(performance.now() - started), streaming: startedStream }
+        },
+        runTool: (name, args) => runTool(name, args),
+        toolOutputs: (results) => provider.toolOutputs(results),
+        onRound: (step) => llm.line(`→ раунд ${step}`),
+        onTurn: llm.turn,
+        onTool: async (item) => {
+          await writeSse(res, { type: 'tool', name: item.name, args: preview(item.arguments), ok: item.ok, output: preview(item.output) })
+          llm.tool(item.name, item.ok, item.output)
+        },
+        onStep: (record) => llm.step(record),
+        onHttpError: (status, message) => llm.line(`← HTTP ${status}: ${message}`),
+      },
+    })
+    const agent = result.state
+    if (agent.aborted || upstreamAbort.signal.aborted || res.destroyed) return
     if (!streaming) {
-      writeJson(res, failureStatus, { error: { message: failed ?? 'Пустой ответ' } })
+      writeJson(res, agent.failureStatus, { error: { message: agent.failed ?? 'Пустой ответ' } })
       return
     }
-    if (failed) {
-      await writeSse(res, { type: 'error', error: { message: failed }, ...(agent.usage ? { usage: usageToApi(agent.usage) } : {}) })
+    if (agent.failed) {
+      await writeSse(res, { type: 'error', error: { message: agent.failed }, ...(agent.usage ? { usage: usageToApi(agent.usage) } : {}) })
     } else {
       await writeSse(res, {
-        type: noticeReason !== null ? 'response.incomplete' : 'response.completed',
+        type: agent.noticeReason !== null ? 'response.incomplete' : 'response.completed',
         response: {
-          status: noticeReason !== null ? 'incomplete' : 'completed',
-          ...(noticeReason !== null ? { incomplete_details: noticeReason ? { reason: noticeReason } : {} } : {}),
+          status: agent.noticeReason !== null ? 'incomplete' : 'completed',
+          ...(agent.noticeReason !== null ? { incomplete_details: agent.noticeReason ? { reason: agent.noticeReason } : {} } : {}),
           ...(agent.usage ? { usage: usageToApi(agent.usage) } : {}),
         },
       })
@@ -272,7 +229,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
   } catch (error) {
     if (upstreamAbort.signal.aborted || res.destroyed) return
     const message = error instanceof Error ? error.message : 'Внутренняя ошибка'
-    llm.step(apiErrorRecord(agent, null, agent.usage, message))
+    llm.step(apiErrorRecord(observed, null, observed.usage, message))
     if (!streaming) throw error
     await writeSse(res, { type: 'error', error: { message } })
     if (!res.writableEnded) res.end()
