@@ -249,20 +249,19 @@ function buildAssistant(blocks: Map<number, Record<string, unknown>>): { ok: tru
       const id = typeof block.id === 'string' ? block.id : ''
       const name = typeof block.name === 'string' ? block.name : ''
       if (!id || !name) return { ok: false, error: 'Вызов инструмента без идентификатора' }
-      const raw = textOf(block.partial_json) || '{}'
-      let input: unknown = {}
-      try {
-        input = JSON.parse(raw)
-      } catch {
-        input = {}
-      }
-      content.push({ type: 'tool_use', id, name, input })
-      calls.push({ callId: id, name, arguments: raw })
+      const payload = claudeToolPayload(textOf(block.partial_json))
+      content.push({ type: 'tool_use', id, name, input: payload.input })
+      calls.push({ callId: id, name, arguments: payload.arguments })
       continue
     }
     if (type) content.push(replayBlock(block))
   }
   return { ok: true, content, calls }
+}
+
+export function claudeToolPayload(partialJson: string): { arguments: string; input: unknown } {
+  const parsed = parseJsonText(partialJson)
+  return { arguments: partialJson, input: parsed.ok ? parsed.value : partialJson }
 }
 
 function replayBlock(block: Record<string, unknown>) {

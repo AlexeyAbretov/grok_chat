@@ -235,7 +235,7 @@ function finishCalls(calls: Map<number, GeminiCall>): { ok: true; calls: Functio
   const result: FunctionCall[] = []
   for (const call of ordered) {
     if (!call.id || !call.name) return { ok: false, error: 'Вызов инструмента без идентификатора' }
-    result.push({ callId: call.id, name: call.name, arguments: call.arguments || '{}' })
+    result.push({ callId: call.id, name: call.name, arguments: call.arguments })
   }
   return { ok: true, calls: result }
 }

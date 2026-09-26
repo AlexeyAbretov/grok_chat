@@ -2,7 +2,8 @@ import { readFileSync, unlinkSync } from 'node:fs'
 import { relative, resolve, sep } from 'node:path'
 import { createLlmLog, formatLlmItem, llmLogPath } from '../server/llm-log.ts'
 import { locateNote, runTool, type ToolIo } from '../server/tools.ts'
-import { addUsage, consumeTurn } from '../server/turn.ts'
+import { claudeToolPayload } from '../server/providers/claude.ts'
+import { addUsage, consumeTurn, executeToolCalls, planToolRound } from '../server/turn.ts'
 
 function assert(condition: unknown, message: string) {
   if (!condition) throw new Error(message)
@@ -173,5 +174,49 @@ const chatLog = createLlmLog(logId)
 chatLog.line('проверка файла')
 assert(logFile && readFileSync(logFile, 'utf8').includes(`[llm] проверка файла`) && readFileSync(logFile, 'utf8').includes(logId), 'a chat log is appended to its file')
 if (logFile) unlinkSync(logFile)
+
+const cutRound = planToolRound({
+  incompleteReason: 'max_output_tokens',
+  calls: [{ arguments: '{"op":"div","a":1,"b":0}' }],
+})
+assert(cutRound.action === 'truncated' && cutRound.noticeReason === 'max_output_tokens', 'a truncated round keeps its stop reason and does not run tools')
+
+const brokenArgs = planToolRound({
+  incompleteReason: null,
+  calls: [{ arguments: '{"op":"div"' }],
+})
+assert(brokenArgs.action === 'truncated', 'broken tool json stops the round before execution')
+
+const ready = planToolRound({
+  incompleteReason: null,
+  calls: [{ arguments: '{"op":"div","a":1,"b":0}' }],
+})
+assert(ready.action === 'tools', 'complete tool json is still executed')
+
+const plain = planToolRound({ incompleteReason: null, calls: [] })
+assert(plain.action === 'finish' && plain.noticeReason === null, 'a plain answer finishes the round')
+
+let toolRuns = 0
+const zeroRound = executeToolCalls(
+  [
+    { callId: '1', name: 'calculator', arguments: '{"op":"div","a":1,"b":0}' },
+    { callId: '2', name: 'calculator', arguments: '{"op":"add","a":1,"b":1}' },
+  ],
+  (name, args) => {
+    toolRuns += 1
+    return runTool(name, args)
+  },
+)
+assert(zeroRound.stop === 'tool' && toolRuns === 1 && zeroRound.executed[0]?.output === 'Деление на ноль', 'a tool error stops the round')
+
+const cutPayload = claudeToolPayload('{"op":"div"')
+assert(cutPayload.arguments === '{"op":"div"' && typeof cutPayload.input === 'string', 'truncated Claude tool json is not replaced with {}')
+const emptyPayload = claudeToolPayload('')
+assert(emptyPayload.arguments === '' && emptyPayload.input === '', 'empty Claude tool json is not replaced with {}')
+const wholePayload = claudeToolPayload('{"op":"add","a":1,"b":2}')
+assert(
+  wholePayload.input && typeof wholePayload.input === 'object' && (wholePayload.input as { op?: string }).op === 'add',
+  'complete Claude tool json is parsed',
+)
 
 console.log('tools ok')

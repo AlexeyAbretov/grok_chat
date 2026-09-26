@@ -170,6 +170,49 @@ async function applyUpstream(value: unknown, state: TurnState, emit: (event: unk
   }
 }
 
+export type ToolRoundPlan =
+  | { action: 'finish'; noticeReason: string | null }
+  | { action: 'truncated'; noticeReason: string }
+  | { action: 'tools' }
+
+export function planToolRound(turn: { calls: readonly { arguments: string }[]; incompleteReason: string | null }): ToolRoundPlan {
+  if (turn.incompleteReason !== null) return { action: 'truncated', noticeReason: turn.incompleteReason }
+  if (turn.calls.length === 0) return { action: 'finish', noticeReason: null }
+  for (const call of turn.calls) {
+    if (!parseJsonText(call.arguments).ok) return { action: 'truncated', noticeReason: '' }
+  }
+  return { action: 'tools' }
+}
+
+export type ExecutedTool = {
+  callId: string
+  name: string
+  arguments: string
+  ok: boolean
+  output: string
+}
+
+export function executeToolCalls(
+  calls: readonly FunctionCall[],
+  run: (name: string, args: unknown) => { ok: boolean; output: string },
+): { stop: null | 'tool' | 'truncated'; executed: ExecutedTool[] } {
+  const executed: ExecutedTool[] = []
+  for (const call of calls) {
+    const parsed = parseJsonText(call.arguments)
+    if (!parsed.ok) return { stop: 'truncated', executed }
+    const result = run(call.name, parsed.value)
+    executed.push({
+      callId: call.callId,
+      name: call.name,
+      arguments: call.arguments,
+      ok: result.ok,
+      output: result.output,
+    })
+    if (!result.ok) return { stop: 'tool', executed }
+  }
+  return { stop: null, executed }
+}
+
 function readCalls(output: unknown[]): { ok: true; calls: FunctionCall[] } | { ok: false; error: string } {
   const calls: FunctionCall[] = []
   for (const item of output) {

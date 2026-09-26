@@ -10,7 +10,7 @@ import { llmForModel, providerStatus } from './providers/index.ts'
 import type { ChatInputMessage } from './providers/types.ts'
 import { runTool, TOOLS } from './tools.ts'
 import type { Usage } from '../shared/protocol.ts'
-import { addUsage, usageToApi } from './turn.ts'
+import { addUsage, executeToolCalls, planToolRound, usageToApi } from './turn.ts'
 
 const MAX_BODY = 2_000_000
 const MAX_CHAT_BODY = 8_000_000
@@ -199,20 +199,28 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
         failed = turn.failed
         break
       }
-      if (turn.calls.length === 0) {
-        noticeReason = turn.incompleteReason
+      const plan = planToolRound(turn)
+      if (plan.action !== 'tools') {
+        noticeReason = plan.noticeReason
         break
       }
 
-      const outputs = []
-      for (const call of turn.calls) {
-        const parsedArgs = parseJsonText(call.arguments)
-        const result = parsedArgs.ok ? runTool(call.name, parsedArgs.value) : { ok: false as const, output: 'Некорректный JSON' }
-        await writeSse(res, { type: 'tool', name: call.name, args: preview(call.arguments), ok: result.ok, output: preview(result.output) })
-        llm.tool(call.name, result.ok, result.output)
-        outputs.push({ callId: call.callId, ok: result.ok, output: result.output })
+      const tools = executeToolCalls(turn.calls, (name, args) => runTool(name, args))
+      for (const item of tools.executed) {
+        await writeSse(res, { type: 'tool', name: item.name, args: preview(item.arguments), ok: item.ok, output: preview(item.output) })
+        llm.tool(item.name, item.ok, item.output)
       }
-      transcript = [...transcript, ...turn.output, ...provider.toolOutputs(outputs)]
+      if (tools.stop === 'truncated') {
+        noticeReason = ''
+        break
+      }
+      if (tools.stop === 'tool') break
+
+      transcript = [
+        ...transcript,
+        ...turn.output,
+        ...provider.toolOutputs(tools.executed.map((item) => ({ callId: item.callId, ok: item.ok, output: item.output }))),
+      ]
 
       if (round === MAX_TOOL_ROUNDS - 1) noticeReason = 'max_tool_rounds'
     }
