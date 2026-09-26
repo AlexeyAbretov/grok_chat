@@ -1,7 +1,8 @@
-import { readFileSync, unlinkSync } from 'node:fs'
+import { existsSync, readFileSync, unlinkSync } from 'node:fs'
 import { relative, resolve, sep } from 'node:path'
-import { createLlmLog, formatLlmItem, llmLogPath } from '../server/llm-log.ts'
-import { locateNote, runTool, type ToolIo } from '../server/tools.ts'
+import { agentBlock, createAgentState, MAX_COST_TICKS, MAX_TOOL_ROUNDS, modelStepRecord, runAgentTools } from '../server/agent.ts'
+import { createLlmLog, formatLlmItem, llmLogPath, llmTracePath } from '../server/llm-log.ts'
+import { chatTools, locateNote, runTool, type ToolIo } from '../server/tools.ts'
 import { claudeToolPayload } from '../server/providers/claude.ts'
 import { consumeGeminiText, geminiTextCall, geminiThoughtSignature, geminiToolCall, joinGeminiMessages } from '../server/providers/gemini.ts'
 import { addUsage, consumeTurn, executeToolCalls, planToolRound } from '../server/turn.ts'
@@ -73,6 +74,7 @@ assert(!missing.ok && missing.output === 'Файл не найден', 'missing 
 assert(runTool('search_notes', { query: '   ' }, blocked).output === 'Пустой запрос', 'blank search does not read files')
 
 const found = runTool('search_notes', { query: 'Санкт-Петербург' }, {
+  listNotes: () => ['c.md', 'a.md', 'b.md'],
   readFile(file) {
     if (file.endsWith(`${sep}a.md`)) return `${'x'.repeat(80)}город Санкт-Петербург стоит${'y'.repeat(80)}`
     if (file.endsWith(`${sep}b.md`)) return 'бета'
@@ -87,6 +89,46 @@ assert(payload.matches[0].file === 'a.md' && payload.matches[0].line === 1, 'fir
 assert(payload.matches[0].snippet.startsWith('…') && payload.matches[0].snippet.endsWith('…'), 'snippet is a short window')
 assert(payload.matches[0].snippet.includes('Санкт-Петербург'), 'snippet contains the match')
 assert(payload.matches[1].file === 'c.md' && payload.matches[1].line === 2, 'second hit is on the next line')
+
+const addedNote = runTool('search_notes', { query: 'новый' }, {
+  listNotes: () => ['d.md', 'a.md'],
+  readFile(file) {
+    if (file.endsWith(`${sep}d.md`)) return 'новый файл'
+    if (file.endsWith(`${sep}a.md`)) return 'старый'
+    throw new Error(`unexpected ${file}`)
+  },
+})
+const addedPayload = JSON.parse(addedNote.output) as { matches: { file: string }[] }
+assert(addedNote.ok && addedPayload.matches.length === 1 && addedPayload.matches[0].file === 'd.md', 'search includes a file that is in the folder now')
+
+let readOutside = false
+const ignored = runTool('search_notes', { query: 'x' }, {
+  listNotes: () => ['../../.env', 'a.md'],
+  readFile(file) {
+    if (file.includes('.env')) readOutside = true
+    return 'x'
+  },
+})
+assert(ignored.ok && !readOutside, 'a listed path outside notes is not read')
+
+const missingDir = runTool('search_notes', { query: 'x' }, {
+  listNotes() {
+    throw new Error('notes missing')
+  },
+  readFile: blockingRead,
+})
+assert(!missingDir.ok && missingDir.output === 'Нет файлов заметок', 'a missing notes folder is a tool error')
+
+const described = chatTools({
+  listNotes: () => ['b.md', 'd.md'],
+  readFile: blockingRead,
+})
+const searchTool = described.find((tool) => tool.name === 'search_notes')
+const readTool = described.find((tool) => tool.name === 'read_file')
+if (!searchTool || !readTool) throw new Error('tool descriptions are missing')
+assert(searchTool.description.includes('notes/b.md') && searchTool.description.includes('notes/d.md'), 'the tool description lists the current notes')
+assert(!searchTool.description.includes('c.md'), 'the tool description omits a file that is not in the folder')
+assert(readTool.description.includes('notes/d.md'), 'read_file mentions the current notes')
 
 function sse(events: unknown[]) {
   const text = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')
@@ -171,11 +213,45 @@ assert(llmLogPath('../.env') === null, 'a log path cannot leave logs/')
 assert(llmLogPath('notes/a.md') === null, 'a note path is not a chat log')
 const logId = '33333333-3333-4333-8333-333333333333'
 const logFile = llmLogPath(logId)
+const traceFile = llmTracePath(logId)
 assert(logFile?.endsWith(`${sep}logs${sep}${logId}.log`), 'a chat log stays inside logs/')
+assert(traceFile?.endsWith(`${sep}logs${sep}${logId}.jsonl`), 'a step trace stays inside logs/')
+assert(llmTracePath('../.env') === null, 'a step trace cannot leave logs/')
 const chatLog = createLlmLog(logId)
 chatLog.line('проверка файла')
-assert(logFile && readFileSync(logFile, 'utf8').includes(`[llm] проверка файла`) && readFileSync(logFile, 'utf8').includes(logId), 'a chat log is appended to its file')
+chatLog.turn(1, [], null, null, { inputTokens: 1, outputTokens: 2, reasoningTokens: null, cachedTokens: null, totalTokens: 3, costTicks: 10 }, 15)
+const loggedText = logFile ? readFileSync(logFile, 'utf8') : ''
+assert(loggedText.includes(`[llm] проверка файла`) && loggedText.includes(logId), 'a chat log is appended to its file')
+assert(loggedText.includes('стоимость 10') && loggedText.includes('латентность 15 мс'), 'cost and latency are written to the text log')
+const longQuery = 'q'.repeat(500)
+const longArgs = JSON.stringify({ query: longQuery })
+assert(!formatLlmItem({ type: 'function_call', name: 'search_notes', arguments: longArgs }).includes(longQuery), 'the text log still clips long arguments')
+const traced = createAgentState('grok-test', 'req-long')
+traced.step = 1
+const longRun = runAgentTools(
+  traced,
+  [{ callId: '1', name: 'search_notes', arguments: longArgs }],
+  () => ({ ok: true, output: longQuery }),
+  33,
+  { inputTokens: 4, outputTokens: 5, reasoningTokens: null, cachedTokens: null, totalTokens: 9, costTicks: 11 },
+)
+const longRecord = longRun.records[0]
+if (!longRecord) throw new Error('a long call writes a step record')
+chatLog.step(longRecord)
+const traceLines = traceFile ? readFileSync(traceFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>) : []
+const longRow = traceLines.find((row) => row.request_id === 'req-long')
+assert(longRow?.arguments === longArgs && longRow.output === longQuery, 'a step record keeps the raw arguments and output')
+assert(longRow?.latency_ms === 33 && longRow.cost_ticks === 11 && longRow.step === 1 && longRow.model === 'grok-test', 'a step record has latency, cost, step, and model')
+assert(longRow?.input_tokens === 4 && longRow.total_tokens === 9, 'a step record has the turn tokens')
+const plainAgent = createAgentState('grok-test', 'req-plain')
+plainAgent.step = 1
+chatLog.step(modelStepRecord(plainAgent, 15, { inputTokens: 1, outputTokens: 2, reasoningTokens: null, cachedTokens: null, totalTokens: 3, costTicks: 10 }))
+const plainLines = traceFile ? readFileSync(traceFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>) : []
+const plainRow = plainLines.find((row) => row.request_id === 'req-plain')
+assert(plainRow?.tool === null && plainRow.arguments === null && plainRow.output === null, 'a round without tools still writes a step record')
+assert(plainRow?.latency_ms === 15 && plainRow.cost_ticks === 10, 'a plain step record keeps latency and cost')
 if (logFile) unlinkSync(logFile)
+if (traceFile && existsSync(traceFile)) unlinkSync(traceFile)
 
 const cutRound = planToolRound({
   incompleteReason: 'max_output_tokens',
@@ -210,6 +286,97 @@ const zeroRound = executeToolCalls(
   },
 )
 assert(zeroRound.stop === 'tool' && toolRuns === 1 && zeroRound.executed[0]?.output === 'Деление на ноль', 'a tool error stops the round')
+
+let searches = 0
+const searchAgent = createAgentState('grok-test', 'req-search')
+searchAgent.step = 1
+const firstSearch = runAgentTools(
+  searchAgent,
+  [{ callId: '1', name: 'search_notes', arguments: '{"query":"город"}' }],
+  () => {
+    searches += 1
+    return { ok: true, output: '{"matches":[]}' }
+  },
+  20,
+  null,
+)
+const repeatSearch = runAgentTools(
+  searchAgent,
+  [{ callId: '2', name: 'search_notes', arguments: '{ "query" : "город" }' }],
+  () => {
+    searches += 1
+    return { ok: true, output: '{"matches":[]}' }
+  },
+  21,
+  null,
+)
+assert(firstSearch.stop === null && searchAgent.calls.length === 1, 'the first search is remembered on the agent')
+assert(repeatSearch.stop === 'duplicate_tool' && searches === 1 && repeatSearch.executed.length === 0, 'the same search is not run again')
+const blockedCall = repeatSearch.records[0]
+if (!blockedCall) throw new Error('a blocked repeat is recorded')
+assert(blockedCall.request_id === 'req-search' && blockedCall.step === 1, 'a blocked repeat is recorded from the agent state')
+assert(blockedCall.arguments === '{ "query" : "город" }' && blockedCall.output === null, 'a blocked repeat keeps the raw arguments and no result')
+
+const honest = createAgentState('grok-test', 'req-honest')
+honest.step = 1
+const honestRun = runAgentTools(
+  honest,
+  [{ callId: '1', name: 'calculator', arguments: '{"op":"add","a":2,"b":3}' }],
+  (name, args) => runTool(name, args),
+  4,
+  null,
+)
+assert(honestRun.stop === null && honestRun.executed[0]?.output === '{"result":5}', 'a true calculator result continues')
+
+let lies = 0
+const liar = createAgentState('grok-test', 'req-lie')
+liar.step = 2
+const lied = runAgentTools(
+  liar,
+  [{ callId: '1', name: 'calculator', arguments: '{"op":"add","a":2,"b":3}' }],
+  () => {
+    lies += 1
+    return { ok: true, output: '{"result":9}' }
+  },
+  8,
+  { inputTokens: 1, outputTokens: 1, reasoningTokens: null, cachedTokens: null, totalTokens: 2, costTicks: 3 },
+)
+const repeatedLie = runAgentTools(
+  liar,
+  [{ callId: '3', name: 'calculator', arguments: '{"b":3,"a":2,"op":"add"}' }],
+  () => {
+    lies += 1
+    return { ok: true, output: '{"result":9}' }
+  },
+  1,
+  null,
+)
+const lieRecord = lied.records[0]
+if (!lieRecord) throw new Error('a lie writes a step record')
+assert(lied.stop === 'tool_mismatch' && lieRecord.output === '{"result":9}' && lieRecord.ok === true, 'a wrong calculator result stops the step')
+assert(lieRecord.stop === 'tool_mismatch' && lieRecord.cost_ticks === 3 && lieRecord.latency_ms === 8, 'the lie record keeps cost and latency')
+assert(repeatedLie.stop === 'duplicate_tool' && lies === 1, 'the same lying call is not run again')
+
+const zeroAgent = createAgentState('grok-test', 'req-zero')
+zeroAgent.step = 1
+const zeroStop = runAgentTools(
+  zeroAgent,
+  [{ callId: '1', name: 'calculator', arguments: '{"op":"div","a":1,"b":0}' }],
+  (name, args) => runTool(name, args),
+  1,
+  null,
+)
+assert(zeroStop.stop === 'tool' && zeroStop.records[0]?.stop === null, 'division by zero stays a tool error')
+
+const budget = createAgentState('grok-test', 'req-budget')
+assert(agentBlock(budget) === null, 'a new request is under budget')
+budget.usage = { inputTokens: 1, outputTokens: 1, reasoningTokens: null, cachedTokens: null, totalTokens: 2, costTicks: MAX_COST_TICKS }
+assert(agentBlock(budget) === 'max_cost', 'the next model call stops at the budget')
+budget.usage = { ...budget.usage, costTicks: MAX_COST_TICKS - 1 }
+assert(agentBlock(budget) === null, 'spend under the budget still continues')
+budget.usage = { ...budget.usage, costTicks: null }
+budget.toolRounds = MAX_TOOL_ROUNDS
+assert(agentBlock(budget) === 'max_tool_rounds', 'the round limit is read from the agent')
 
 const kept = modelHistory([
   { role: 'user', content: '2 / 0' },

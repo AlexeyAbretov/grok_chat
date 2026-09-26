@@ -8,16 +8,14 @@ import { chatDbPath, closeChatDb, openChatDb, readChats, writeChats } from './st
 import { createLlmLog } from './llm-log.ts'
 import { llmForModel, providerStatus } from './providers/index.ts'
 import type { ChatInputMessage } from './providers/types.ts'
-import { runTool, TOOLS } from './tools.ts'
-import type { Usage } from '../shared/protocol.ts'
-import { addUsage, executeToolCalls, planToolRound, usageToApi } from './turn.ts'
+import { chatTools, noteNames, runTool } from './tools.ts'
+import { agentBlock, createAgentState, MAX_COST_TICKS, modelStepRecord, runAgentTools } from './agent.ts'
+import { addUsage, planToolRound, usageToApi } from './turn.ts'
 
 const MAX_BODY = 2_000_000
 const MAX_CHAT_BODY = 8_000_000
 const PORT = Number(process.env.PORT) || 8787
 const DIST = resolve('dist')
-
-const MAX_TOOL_ROUNDS = 5
 
 const STATIC_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -148,7 +146,10 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
   let transcript: unknown[] = []
   const llm = createLlmLog(chatId)
   llm.line(`файл logs/${chatId}.log`)
-  llm.line(`→ ${provider.id}/${model}, tools: ${TOOLS.map((tool) => tool.name).join(', ')}`)
+  const offered = chatTools()
+  const notes = noteNames()
+  llm.line(`→ ${provider.id}/${model}, tools: ${offered.map((tool) => tool.name).join(', ')}`)
+  llm.line(`заметки: ${notes.length ? notes.join(', ') : 'нет файлов'}`)
   llm.items(input)
 
   const upstreamAbort = new AbortController()
@@ -157,26 +158,31 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
   })
 
   let streaming = false
-  let usage: Usage | null = null
   let failed: string | null = null
   let failureStatus = 502
   let noticeReason: string | null = null
   let offerTools = true
-  let toolRounds = 0
-  let turnIndex = 0
+  const agent = createAgentState(model)
+  llm.line(`запрос ${agent.requestId}, бюджет ${MAX_COST_TICKS} тиков`)
 
   try {
-    while (toolRounds < MAX_TOOL_ROUNDS) {
+    while (true) {
       if (upstreamAbort.signal.aborted || res.destroyed) return
-      turnIndex += 1
-      if (turnIndex > 1) llm.line(`→ раунд ${turnIndex}`)
+      const blocked = agentBlock(agent)
+      if (blocked) {
+        noticeReason = blocked
+        break
+      }
+      agent.step += 1
+      if (agent.step > 1) llm.line(`→ раунд ${agent.step}`)
 
+      const started = performance.now()
       const turn = await provider.streamTurn({
         apiKey,
         model,
         messages: input,
         transcript,
-        tools: offerTools ? TOOLS : [],
+        tools: offerTools ? offered : [],
         maxTokens,
         reasoningEffort,
         signal: upstreamAbort.signal,
@@ -191,31 +197,40 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
         emit: (event) => writeSse(res, event),
       })
       if (upstreamAbort.signal.aborted || res.destroyed) return
+      const latencyMs = Math.round(performance.now() - started)
       if (turn.failed && !streaming) {
         failed = turn.failed
         failureStatus = turn.httpStatus || 502
         llm.line(`← HTTP ${failureStatus}: ${failed}`)
+        llm.step(modelStepRecord(agent, latencyMs, turn.usage))
         break
       }
-      usage = addUsage(usage, turn.usage)
-      llm.turn(turnIndex, turn.output, turn.failed, turn.incompleteReason, turn.usage)
+      agent.usage = addUsage(agent.usage, turn.usage)
+      llm.turn(agent.step, turn.output, turn.failed, turn.incompleteReason, turn.usage, latencyMs)
       if (turn.failed) {
         failed = turn.failed
+        llm.step(modelStepRecord(agent, latencyMs, turn.usage))
         break
       }
       const plan = planToolRound(turn)
       if (!offerTools || plan.action !== 'tools') {
+        llm.step(modelStepRecord(agent, latencyMs, turn.usage))
         noticeReason = plan.action === 'tools' ? null : plan.noticeReason
         break
       }
 
-      const tools = executeToolCalls(turn.calls, (name, args) => runTool(name, args))
+      const tools = runAgentTools(agent, turn.calls, (name, args) => runTool(name, args), latencyMs, turn.usage)
       for (const item of tools.executed) {
         await writeSse(res, { type: 'tool', name: item.name, args: preview(item.arguments), ok: item.ok, output: preview(item.output) })
         llm.tool(item.name, item.ok, item.output)
       }
+      for (const record of tools.records) llm.step(record)
       if (tools.stop === 'truncated') {
         noticeReason = ''
+        break
+      }
+      if (tools.stop === 'duplicate_tool' || tools.stop === 'tool_mismatch') {
+        noticeReason = tools.stop
         break
       }
 
@@ -230,8 +245,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
         continue
       }
 
-      toolRounds += 1
-      if (toolRounds === MAX_TOOL_ROUNDS) noticeReason = 'max_tool_rounds'
+      agent.toolRounds += 1
     }
 
     if (upstreamAbort.signal.aborted || res.destroyed) return
@@ -240,14 +254,14 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
       return
     }
     if (failed) {
-      await writeSse(res, { type: 'error', error: { message: failed }, ...(usage ? { usage: usageToApi(usage) } : {}) })
+      await writeSse(res, { type: 'error', error: { message: failed }, ...(agent.usage ? { usage: usageToApi(agent.usage) } : {}) })
     } else {
       await writeSse(res, {
         type: noticeReason !== null ? 'response.incomplete' : 'response.completed',
         response: {
           status: noticeReason !== null ? 'incomplete' : 'completed',
           ...(noticeReason !== null ? { incomplete_details: noticeReason ? { reason: noticeReason } : {} } : {}),
-          ...(usage ? { usage: usageToApi(usage) } : {}),
+          ...(agent.usage ? { usage: usageToApi(agent.usage) } : {}),
         },
       })
     }

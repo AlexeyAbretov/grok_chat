@@ -142,6 +142,30 @@ applyJson(
 )
 assert(toolLimit.events.notices[0] === 'Слишком много вызовов инструментов', 'tool round limit is explained')
 
+const budgetNotice = collect()
+applyJson(
+  { type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'max_cost' } } },
+  flags(),
+  budgetNotice.handlers,
+)
+assert(budgetNotice.events.notices[0] === 'Исчерпан бюджет запроса', 'a budget stop is explained')
+
+const duplicateNotice = collect()
+applyJson(
+  { type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'duplicate_tool' } } },
+  flags(),
+  duplicateNotice.handlers,
+)
+assert(duplicateNotice.events.notices[0] === 'Повторный вызов инструмента', 'a repeated tool call is explained')
+
+const mismatchNotice = collect()
+applyJson(
+  { type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'tool_mismatch' } } },
+  flags(),
+  mismatchNotice.handlers,
+)
+assert(mismatchNotice.events.notices[0] === 'Инструмент вернул неверный результат', 'a false tool result is explained')
+
 const toolEvent = collect()
 applyJson({ type: 'tool', name: 'calculator', ok: false, args: '{"op":"div","a":1,"b":0}', output: 'Деление на ноль' }, flags(), toolEvent.handlers)
 assert(toolEvent.events.tools[0]?.output === 'Деление на ноль' && toolEvent.events.text === '', 'a tool error is not answer text')

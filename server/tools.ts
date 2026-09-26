@@ -1,64 +1,70 @@
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 
 const NOTES_DIR = resolve('notes')
-const NOTE_FILES = ['a.md', 'b.md', 'c.md'] as const
 const OPS = ['add', 'sub', 'mul', 'div'] as const
 const SNIPPET_RADIUS = 48
 const MAX_MATCHES = 20
 const MAX_NOTE_CHARS = 20_000
 const MAX_QUERY = 200
+const MAX_DESCRIBED_NOTES = 40
 
 export type ToolResult = { ok: true; output: string } | { ok: false; output: string }
 
 export type ToolIo = {
   readFile: (file: string) => string
+  listNotes?: () => string[]
 }
 
 const defaultIo: ToolIo = {
   readFile: (file) => readFileSync(file, 'utf8'),
+  listNotes: listNotesOnDisk,
 }
 
-export const TOOLS = [
-  {
-    type: 'function',
-    name: 'calculator',
-    description: 'Складывает, вычитает, умножает или делит два числа. Произвольные выражения не считает.',
-    parameters: {
-      type: 'object',
-      required: ['op', 'a', 'b'],
-      properties: {
-        op: { type: 'string', enum: ['add', 'sub', 'mul', 'div'], description: 'Операция: add, sub, mul или div' },
-        a: { type: 'number', description: 'Первое число' },
-        b: { type: 'number', description: 'Второе число' },
+export function chatTools(io: ToolIo = defaultIo) {
+  const notes = noteNames(io)
+  const listed = describeNoteNames(notes)
+  return [
+    {
+      type: 'function' as const,
+      name: 'calculator',
+      description: 'Складывает, вычитает, умножает или делит два числа. Произвольные выражения не считает.',
+      parameters: {
+        type: 'object',
+        required: ['op', 'a', 'b'],
+        properties: {
+          op: { type: 'string', enum: ['add', 'sub', 'mul', 'div'], description: 'Операция: add, sub, mul или div' },
+          a: { type: 'number', description: 'Первое число' },
+          b: { type: 'number', description: 'Второе число' },
+        },
       },
     },
-  },
-  {
-    type: 'function',
-    name: 'read_file',
-    description: 'Читает один файл из папки notes/. path — путь относительно notes/, например a.md. Пути вне этой папки запрещены.',
-    parameters: {
-      type: 'object',
-      required: ['path'],
-      properties: {
-        path: { type: 'string', description: 'Путь внутри notes/, например a.md' },
+    {
+      type: 'function' as const,
+      name: 'read_file',
+      description: `Читает один файл из папки notes/. path — имя файла внутри notes/. Сейчас там: ${listed}. Пути вне этой папки запрещены.`,
+      parameters: {
+        type: 'object',
+        required: ['path'],
+        properties: {
+          path: { type: 'string', description: 'Имя файла внутри notes/' },
+        },
       },
     },
-  },
-  {
-    type: 'function',
-    name: 'search_notes',
-    description: 'Ищет точную подстроку в notes/a.md, notes/b.md и notes/c.md. Возвращает имя файла, номер строки и короткий фрагмент вокруг совпадения. Без эмбеддингов.',
-    parameters: {
-      type: 'object',
-      required: ['query'],
-      properties: {
-        query: { type: 'string', description: 'Подстрока для поиска' },
+    {
+      type: 'function' as const,
+      name: 'search_notes',
+      description: `Ищет точную подстроку в файлах папки notes/ (${listed}). Возвращает имя файла, номер строки и короткий фрагмент вокруг совпадения. Без эмбеддингов.`,
+      parameters: {
+        type: 'object',
+        required: ['query'],
+        properties: {
+          query: { type: 'string', description: 'Подстрока для поиска' },
+        },
       },
     },
-  },
-] as const
+  ]
+}
 
 export function runTool(name: string, args: unknown, io: ToolIo = defaultIo): ToolResult {
   if (name === 'calculator') return calculator(args)
@@ -147,9 +153,9 @@ function searchNotes(args: unknown, io: ToolIo): ToolResult {
   let truncated = false
   let foundFile = false
 
-  for (const name of NOTE_FILES) {
+  for (const name of noteNames(io)) {
     const located = locateNote(name)
-    if (!located.ok) return fail(located.error)
+    if (!located.ok) continue
     let text = ''
     try {
       text = io.readFile(located.file)
@@ -180,6 +186,32 @@ function searchNotes(args: unknown, io: ToolIo): ToolResult {
 
   if (!foundFile) return fail('Нет файлов заметок')
   return ok({ matches, truncated })
+}
+
+function listNotesOnDisk() {
+  return readdirSync(NOTES_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => entry.name)
+}
+
+export function noteNames(io: ToolIo = defaultIo) {
+  try {
+    const names = (io.listNotes ?? listNotesOnDisk)()
+    return [...new Set(names.filter((name) => safeNoteName(name)))].sort((left, right) => left.localeCompare(right, 'en'))
+  } catch {
+    return []
+  }
+}
+
+function safeNoteName(name: string) {
+  return Boolean(name) && name !== '.' && name !== '..' && !name.includes('/') && !name.includes('\\') && !name.includes('\0')
+}
+
+function describeNoteNames(names: readonly string[]) {
+  if (names.length === 0) return 'файлов нет'
+  const shown = names.slice(0, MAX_DESCRIBED_NOTES).map((name) => `notes/${name}`)
+  const extra = names.length - shown.length
+  return extra > 0 ? `${shown.join(', ')} и ещё ${extra}` : shown.join(', ')
 }
 
 function snippet(line: string, at: number, length: number) {

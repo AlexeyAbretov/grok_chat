@@ -38,7 +38,7 @@ export function Thread({ chat, streamingMessageId }: ThreadProps) {
         <div className="empty">
           <h2>Начните разговор</h2>
           <p>История этого чата хранится на этом компьютере. Можно держать несколько диалогов рядом.</p>
-          <p>В ответах есть калькулятор, чтение папки notes и поиск по a.md, b.md и c.md.</p>
+          <p>В ответах есть калькулятор, чтение и поиск по файлам в папке notes.</p>
         </div>
       ) : (
         chat.messages.map((message) => (

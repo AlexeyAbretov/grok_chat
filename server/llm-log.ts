@@ -3,6 +3,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path'
 import { isChatId } from '../shared/json-schema.ts'
 import type { Usage } from '../shared/protocol.ts'
 import { extractOutput } from '../shared/sse.ts'
+import type { StepRecord } from './agent.ts'
 
 const CLIP = 400
 const LOGS_DIR = resolve('logs')
@@ -10,13 +11,22 @@ const LOGS_DIR = resolve('logs')
 export type LlmLog = {
   line: (text: string) => void
   items: (items: unknown[]) => void
-  turn: (round: number, output: unknown[], failed: string | null, incompleteReason: string | null, usage: Usage | null) => void
+  turn: (round: number, output: unknown[], failed: string | null, incompleteReason: string | null, usage: Usage | null, latencyMs: number) => void
   tool: (name: string, ok: boolean, output: string) => void
+  step: (record: StepRecord) => void
 }
 
 export function llmLogPath(chatId: string) {
+  return logFile(chatId, '.log')
+}
+
+export function llmTracePath(chatId: string) {
+  return logFile(chatId, '.jsonl')
+}
+
+function logFile(chatId: string, ext: '.log' | '.jsonl') {
   if (!isChatId(chatId)) return null
-  const file = join(LOGS_DIR, `${chatId}.log`)
+  const file = join(LOGS_DIR, `${chatId}${ext}`)
   const rel = relative(LOGS_DIR, file)
   if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null
   return file
@@ -36,18 +46,33 @@ export function createLlmLog(chatId: string): LlmLog {
     items(items) {
       for (const item of items) line(`  ${formatLlmItem(item)}`)
     },
-    turn(round, output, failed, incompleteReason, usage) {
+    turn(round, output, failed, incompleteReason, usage, latencyMs) {
       if (failed) {
         line(`← раунд ${round} ошибка: ${failed}`)
+        line(`  латентность ${latencyMs} мс`)
         return
       }
       if (output.length === 0) line(`← раунд ${round} пустой ответ`)
       for (const item of output) line(`← ${formatLlmItem(item)}`)
       if (incompleteReason !== null) line(`  обрезан: ${incompleteReason || 'без причины'}`)
-      if (usage) line(`  токены: вход ${usage.inputTokens}, ответ ${usage.outputTokens}, всего ${usage.totalTokens}`)
+      if (usage) {
+        const cost = usage.costTicks === null ? '—' : String(usage.costTicks)
+        line(`  токены: вход ${usage.inputTokens}, ответ ${usage.outputTokens}, всего ${usage.totalTokens}, стоимость ${cost}`)
+      }
+      line(`  латентность ${latencyMs} мс`)
     },
     tool(name, ok, output) {
       line(`→ tool ${name} ${ok ? clip(output) : `ошибка: ${clip(output)}`}`)
+    },
+    step(record) {
+      const trace = llmTracePath(chatId)
+      if (!trace) return
+      try {
+        appendFileSync(trace, `${JSON.stringify(record)}\n`, 'utf8')
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'не удалось записать след'
+        console.error(`[llm] ${message}`)
+      }
     },
   }
 }

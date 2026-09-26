@@ -164,6 +164,9 @@ function incompleteNotice(reason: string | undefined) {
   if (!reason) return 'Ответ обрезан'
   if (reason === 'max_output_tokens') return 'Достигнут лимит токенов'
   if (reason === 'max_tool_rounds') return 'Слишком много вызовов инструментов'
+  if (reason === 'max_cost') return 'Исчерпан бюджет запроса'
+  if (reason === 'duplicate_tool') return 'Повторный вызов инструмента'
+  if (reason === 'tool_mismatch') return 'Инструмент вернул неверный результат'
   return `Ответ обрезан: ${reason}`
 }
 
