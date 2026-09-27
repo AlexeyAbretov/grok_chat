@@ -6,7 +6,7 @@ import { chatTools, locateNote, runTool, type ToolIo } from '../server/tools.ts'
 import { claudeToolPayload } from '../server/providers/claude.ts'
 import { consumeGeminiText, geminiTextCall, geminiThoughtSignature, geminiToolCall, joinGeminiMessages } from '../server/providers/gemini.ts'
 import { addUsage, consumeTurn, executeToolCalls, planToolRound } from '../server/turn.ts'
-import { modelHistory } from '../src/api.ts'
+import { modelHistory } from '../shared/history.ts'
 
 function assert(condition: unknown, message: string) {
   if (!condition) throw new Error(message)

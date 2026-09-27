@@ -9,7 +9,9 @@ const valid = {
   model: 'grok-4.7',
   reasoningEffort: 'high',
   maxTokens: 4096,
-  messages: [{ role: 'user', content: 'привет' }],
+  content: 'привет',
+  userMessageId: '22222222-2222-4222-8222-222222222222',
+  assistantMessageId: '33333333-3333-4333-8333-333333333333',
 }
 
 function messageFor(value: unknown) {
@@ -20,12 +22,17 @@ function messageFor(value: unknown) {
 }
 
 const ok = parseChatRequest(JSON.stringify(valid))
-assert(ok.ok && ok.request.messages[0].content === 'привет' && ok.request.chatId === valid.chatId, 'valid request is accepted')
+assert(ok.ok && ok.request.content === 'привет' && ok.request.chatId === valid.chatId, 'valid request is accepted')
+assert(messageFor({ ...valid, content: '  ' }) === 'Пустое сообщение', 'blank content is rejected')
+assert(
+  messageFor({ ...valid, assistantMessageId: valid.userMessageId }) === 'Недопустимое значение «assistantMessageId»',
+  'message ids must differ',
+)
 
 assert(messageFor({ ...valid, store: false }) === 'Лишнее поле «store»', 'extra root field is rejected')
 assert(
-  messageFor({ ...valid, messages: [{ role: 'user', content: 'привет', id: '1' }] }) === 'Лишнее поле «messages[0].id»',
-  'extra message field is rejected',
+  messageFor({ ...valid, messages: [{ role: 'user', content: 'привет' }] }) === 'Лишнее поле «messages»',
+  'message history is rejected',
 )
 assert(messageFor({ ...valid, model: 1 }) === 'Неверный тип «model»', 'wrong model type is rejected')
 assert(messageFor({ ...valid, maxTokens: '4096' }) === 'Неверный тип «maxTokens»', 'string token limit is rejected')
@@ -36,11 +43,9 @@ assert(anyModel.ok && anyModel.request.model === 'gpt', 'schema accepts a model 
 assert(messageFor({ ...valid, model: '' }) === 'Недопустимое значение «model»', 'empty model is rejected')
 assert(messageFor({ ...valid, model: '   ' }) === 'Недопустимое значение «model»', 'blank model is rejected')
 assert(
-  messageFor({ chatId: valid.chatId, model: 'grok-4.7', reasoningEffort: 'high', maxTokens: 4096 }) === 'Нет поля «messages»',
+  messageFor({ chatId: valid.chatId, model: 'grok-4.7', reasoningEffort: 'high' }) === 'Нет поля «maxTokens»',
   'missing field is rejected',
 )
-assert(messageFor({ ...valid, messages: [] }) === 'Пустое сообщение', 'empty history is rejected')
-assert(messageFor({ ...valid, messages: [{ role: 'user', content: '  ' }] }) === 'Пустое сообщение', 'blank content is rejected')
 assert(messageFor({ ...valid, chatId: '../.env' }) === 'Недопустимое значение «chatId»', 'a path is not a chat id')
 assert(messageFor({ ...valid, chatId: 'logs/chat' }) === 'Недопустимое значение «chatId»', 'a chat id must be a uuid')
 const withoutChat: Record<string, unknown> = { ...valid }

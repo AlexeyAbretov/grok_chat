@@ -2,15 +2,19 @@ import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { parseChatRequest, parseJsonText } from '../shared/json-schema.ts'
-import { parsePersistedState } from '../shared/state.ts'
-import { chatDbPath, closeChatDb, openChatDb, readChats, writeChats } from './store.ts'
+import { modelHistory } from '../shared/history.ts'
+import { isChatId, parseChatRequest, parseJsonText } from '../shared/json-schema.ts'
+import type { ToolTrace, Usage } from '../shared/protocol.ts'
+import { applyJson, type StreamFlags } from '../shared/sse.ts'
+import { parsePersistedState, type Chat } from '../shared/state.ts'
+import { beginTurn, chatDbPath, closeChatDb, deleteChat, insertChat, openChatDb, readChat, readChats, setActiveId, updateMessage } from './store.ts'
 import { createLlmLog } from './llm-log.ts'
 import { llmForModel, providerStatus } from './providers/index.ts'
 import type { ChatInputMessage } from './providers/types.ts'
 import { chatTools, noteNames, runTool } from './tools.ts'
-import { agentBlock, answerText, apiErrorRecord, blockedStepRecord, createAgentState, finishStop, MAX_COST_TICKS, modelStepRecord, runAgentTools } from './agent.ts'
-import { addUsage, planToolRound, usageToApi } from './turn.ts'
+import { apiErrorRecord, MAX_COST_TICKS } from './agent.ts'
+import { createAgentRun, runAgentGraph } from './agent-graph.ts'
+import { usageToApi } from './turn.ts'
 
 const MAX_BODY = 2_000_000
 const MAX_CHAT_BODY = 8_000_000
@@ -81,6 +85,14 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     await handleChats(req, res)
     return
   }
+  if (path === '/api/active') {
+    await handleActive(req, res)
+    return
+  }
+  if (path.startsWith('/api/chats/')) {
+    await handleOneChat(path.slice('/api/chats/'.length), req, res)
+    return
+  }
   if (serveStatic(req, res)) return
   writeJson(res, 404, { error: { message: 'Не найдено' } })
 }
@@ -90,7 +102,7 @@ async function handleChats(req: IncomingMessage, res: ServerResponse) {
     writeJson(res, 200, readChats())
     return
   }
-  if (req.method !== 'PUT') {
+  if (req.method !== 'POST') {
     writeJson(res, 405, { error: { message: 'Метод не поддерживается' } })
     return
   }
@@ -101,17 +113,59 @@ async function handleChats(req: IncomingMessage, res: ServerResponse) {
     writeJson(res, 400, { error: { message: parsed.reason === 'truncated' ? 'JSON обрезан' : 'Некорректный JSON' } })
     return
   }
-  const state = parsePersistedState(parsed.value)
-  if (!state.ok) {
-    writeJson(res, 400, { error: { message: state.message } })
+  const chat = parseIncomingChat(parsed.value)
+  if (!chat) {
+    writeJson(res, 400, { error: { message: 'Некорректный чат' } })
     return
   }
-  if (state.state.chats.length === 0) {
-    writeJson(res, 400, { error: { message: 'Нужен хотя бы один чат' } })
+  if (!insertChat(chat)) {
+    writeJson(res, 409, { error: { message: 'Чат уже есть' } })
     return
   }
-  writeChats(state.state)
   writeJson(res, 200, { ok: true })
+}
+
+async function handleActive(req: IncomingMessage, res: ServerResponse) {
+  if (req.method !== 'POST') {
+    writeJson(res, 405, { error: { message: 'Метод не поддерживается' } })
+    return
+  }
+  const raw = await readBody(req, 1000)
+  const parsed = parseJsonText(raw)
+  if (!parsed.ok) {
+    writeJson(res, 400, { error: { message: parsed.reason === 'truncated' ? 'JSON обрезан' : 'Некорректный JSON' } })
+    return
+  }
+  if (!parsed.value || typeof parsed.value !== 'object' || Array.isArray(parsed.value)) {
+    writeJson(res, 400, { error: { message: 'Неверный тип «тело»' } })
+    return
+  }
+  const activeId = 'activeId' in parsed.value ? parsed.value.activeId : undefined
+  if (!isChatId(activeId)) {
+    writeJson(res, 400, { error: { message: 'Недопустимое значение «activeId»' } })
+    return
+  }
+  if (!setActiveId(activeId)) {
+    writeJson(res, 404, { error: { message: 'Чат не найден' } })
+    return
+  }
+  writeJson(res, 200, { ok: true })
+}
+
+async function handleOneChat(id: string, req: IncomingMessage, res: ServerResponse) {
+  if (!isChatId(id)) {
+    writeJson(res, 404, { error: { message: 'Чат не найден' } })
+    return
+  }
+  if (req.method === 'DELETE') {
+    if (!deleteChat(id)) {
+      writeJson(res, 404, { error: { message: 'Чат не найден' } })
+      return
+    }
+    writeJson(res, 200, { ok: true })
+    return
+  }
+  writeJson(res, 405, { error: { message: 'Метод не поддерживается' } })
 }
 
 async function handleChat(req: IncomingMessage, res: ServerResponse) {
@@ -127,7 +181,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
     return
   }
 
-  const { chatId, model, reasoningEffort, maxTokens, messages } = parsed.request
+  const { chatId, model, reasoningEffort, maxTokens, content, userMessageId, assistantMessageId } = parsed.request
   const provider = llmForModel(model)
   if (!provider) {
     writeJson(res, 400, { error: { message: 'Неизвестная модель' } })
@@ -142,8 +196,23 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
     return
   }
 
-  const input: ChatInputMessage[] = [{ role: 'system', content: provider.systemPrompt }, ...messages]
-  let transcript: unknown[] = []
+  const started = beginTurn({ chatId, content, userMessageId, assistantMessageId, model, maxTokens, reasoningEffort })
+  if (!started.ok) {
+    writeJson(res, started.reason === 'duplicate' ? 409 : 404, {
+      error: { message: started.reason === 'duplicate' ? 'Сообщение уже есть' : 'Чат не найден' },
+    })
+    return
+  }
+
+  const chat = readChat(chatId)
+  const history = modelHistory(chat?.messages ?? [])
+  const latest = history[history.length - 1]
+  if (!latest || latest.role !== 'user' || !latest.content.trim()) {
+    writeJson(res, 400, { error: { message: 'Нет сообщения пользователя' } })
+    return
+  }
+
+  const input: ChatInputMessage[] = [{ role: 'system', content: provider.systemPrompt }, ...history]
   const llm = createLlmLog(chatId)
   llm.line(`файл logs/${chatId}.log`)
   const offered = chatTools()
@@ -158,124 +227,100 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
   })
 
   let streaming = false
-  let failed: string | null = null
-  let failureStatus = 502
-  let noticeReason: string | null = null
-  let offerTools = true
-  const agent = createAgentState(model)
-  llm.line(`запрос ${agent.requestId}, бюджет ${MAX_COST_TICKS} тиков`)
+  let failure: string | null = null
+  const spoken = createSpoken()
+  const run = createAgentRun(model)
+  let observed = run
+  llm.line(`запрос ${run.requestId}, бюджет ${MAX_COST_TICKS} тиков`)
+
+  const emit = (event: unknown) => {
+    spoken.note(event)
+    return writeSse(res, event)
+  }
 
   try {
-    while (true) {
-      if (upstreamAbort.signal.aborted || res.destroyed) return
-      const blocked = agentBlock(agent)
-      if (blocked) {
-        noticeReason = blocked
-        llm.step(blockedStepRecord(agent, blocked))
-        break
-      }
-      agent.step += 1
-      if (agent.step > 1) llm.line(`→ раунд ${agent.step}`)
-
-      const started = performance.now()
-      const turn = await provider.streamTurn({
-        apiKey,
-        model,
-        messages: input,
-        transcript,
-        tools: offerTools ? offered : [],
-        maxTokens,
-        reasoningEffort,
-        signal: upstreamAbort.signal,
-        beginStream: () => {
-          if (streaming) return
-          streaming = true
-          res.statusCode = 200
-          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
-          res.setHeader('Cache-Control', 'no-cache, no-transform')
-          res.setHeader('X-Accel-Buffering', 'no')
-        },
-        emit: (event) => writeSse(res, event),
-      })
-      if (upstreamAbort.signal.aborted || res.destroyed) return
-      const latencyMs = Math.round(performance.now() - started)
-      if (turn.failed && !streaming) {
-        failed = turn.failed
-        failureStatus = turn.httpStatus || 502
-        llm.line(`← HTTP ${failureStatus}: ${failed}`)
-        llm.step(apiErrorRecord(agent, latencyMs, turn.usage, failed))
-        break
-      }
-      agent.usage = addUsage(agent.usage, turn.usage)
-      llm.turn(agent.step, turn.output, turn.failed, turn.incompleteReason, turn.usage, latencyMs)
-      if (turn.failed) {
-        failed = turn.failed
-        llm.step(apiErrorRecord(agent, latencyMs, turn.usage, failed))
-        break
-      }
-      const plan = planToolRound(turn)
-      const text = answerText(turn.output)
-      if (!offerTools || plan.action !== 'tools') {
-        const notice = plan.action === 'tools' ? null : plan.noticeReason
-        llm.step(modelStepRecord(agent, latencyMs, turn.usage, text, finishStop(plan.action, notice)))
-        noticeReason = notice
-        break
-      }
-
-      const tools = runAgentTools(agent, turn.calls, (name, args) => runTool(name, args), latencyMs, turn.usage, text)
-      for (const item of tools.executed) {
-        await writeSse(res, { type: 'tool', name: item.name, args: preview(item.arguments), ok: item.ok, output: preview(item.output) })
+    const agent = await runAgentGraph(run, {
+      signal: upstreamAbort.signal,
+      observe: (state) => {
+        observed = state
+      },
+      callModel: async (state) => {
+        let startedStream = state.streaming
+        const started = performance.now()
+        const turn = await provider.streamTurn({
+          apiKey,
+          model,
+          messages: input,
+          transcript: state.transcript,
+          tools: state.offerTools ? offered : [],
+          maxTokens,
+          reasoningEffort,
+          signal: upstreamAbort.signal,
+          beginStream: () => {
+            startedStream = true
+            if (streaming) return
+            streaming = true
+            res.statusCode = 200
+            res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+            res.setHeader('Cache-Control', 'no-cache, no-transform')
+            res.setHeader('X-Accel-Buffering', 'no')
+          },
+          emit,
+        })
+        return { turn, latencyMs: Math.round(performance.now() - started), streaming: startedStream }
+      },
+      runTool: (name, args) => runTool(name, args),
+      toolOutputs: (results) => provider.toolOutputs(results),
+      onRound: (step) => llm.line(`→ раунд ${step}`),
+      onTurn: llm.turn,
+      onTool: async (item) => {
+        await emit({ type: 'tool', name: item.name, args: preview(item.arguments), ok: item.ok, output: preview(item.output) })
         llm.tool(item.name, item.ok, item.output)
+      },
+      onStep: (record) => llm.step(record),
+      onHttpError: (status, message) => llm.line(`← HTTP ${status}: ${message}`),
+    })
+    if (!(agent.aborted || upstreamAbort.signal.aborted || res.destroyed)) {
+      if (!streaming) {
+        failure = agent.failed ?? 'Пустой ответ'
+        writeJson(res, agent.failureStatus, { error: { message: failure } })
+      } else if (agent.failed) {
+        await emit({ type: 'error', error: { message: agent.failed }, ...(agent.usage ? { usage: usageToApi(agent.usage) } : {}) })
+      } else {
+        await emit({
+          type: agent.noticeReason !== null ? 'response.incomplete' : 'response.completed',
+          response: {
+            status: agent.noticeReason !== null ? 'incomplete' : 'completed',
+            ...(agent.noticeReason !== null ? { incomplete_details: agent.noticeReason ? { reason: agent.noticeReason } : {} } : {}),
+            ...(agent.usage ? { usage: usageToApi(agent.usage) } : {}),
+          },
+        })
       }
-      for (const record of tools.records) llm.step(record)
-      if (tools.stop === 'truncated') {
-        noticeReason = ''
-        break
-      }
-      if (tools.stop === 'duplicate_tool' || tools.stop === 'tool_mismatch') {
-        noticeReason = tools.stop
-        break
-      }
-
-      transcript = [
-        ...transcript,
-        ...turn.output,
-        ...provider.toolOutputs(tools.executed.map((item) => ({ callId: item.callId, ok: item.ok, output: item.output }))),
-      ]
-
-      if (tools.stop === 'tool') {
-        offerTools = false
-        continue
-      }
-
-      agent.toolRounds += 1
+      if (streaming && !res.writableEnded) res.end()
     }
-
-    if (upstreamAbort.signal.aborted || res.destroyed) return
-    if (!streaming) {
-      writeJson(res, failureStatus, { error: { message: failed ?? 'Пустой ответ' } })
-      return
-    }
-    if (failed) {
-      await writeSse(res, { type: 'error', error: { message: failed }, ...(agent.usage ? { usage: usageToApi(agent.usage) } : {}) })
-    } else {
-      await writeSse(res, {
-        type: noticeReason !== null ? 'response.incomplete' : 'response.completed',
-        response: {
-          status: noticeReason !== null ? 'incomplete' : 'completed',
-          ...(noticeReason !== null ? { incomplete_details: noticeReason ? { reason: noticeReason } : {} } : {}),
-          ...(agent.usage ? { usage: usageToApi(agent.usage) } : {}),
-        },
-      })
-    }
-    res.end()
   } catch (error) {
-    if (upstreamAbort.signal.aborted || res.destroyed) return
-    const message = error instanceof Error ? error.message : 'Внутренняя ошибка'
-    llm.step(apiErrorRecord(agent, null, agent.usage, message))
-    if (!streaming) throw error
-    await writeSse(res, { type: 'error', error: { message } })
-    if (!res.writableEnded) res.end()
+    if (!(upstreamAbort.signal.aborted || res.destroyed)) {
+      const message = error instanceof Error ? error.message : 'Внутренняя ошибка'
+      failure = message
+      llm.step(apiErrorRecord(observed, null, observed.usage, message))
+      if (!streaming) throw error
+      await emit({ type: 'error', error: { message } })
+      if (!res.writableEnded) res.end()
+    }
+  } finally {
+    const stopped = upstreamAbort.signal.aborted
+    const spokenMessage = spoken.snapshot(stopped)
+    updateMessage(chatId, {
+      id: assistantMessageId,
+      role: 'assistant',
+      content: spokenMessage.content,
+      reasoning: spokenMessage.reasoning,
+      tools: spokenMessage.tools,
+      usage: spokenMessage.usage,
+      error: stopped ? spokenMessage.error : (spokenMessage.error ?? failure),
+      notice: spokenMessage.notice,
+      stopped,
+    })
   }
 }
 
@@ -340,6 +385,49 @@ function readBody(req: IncomingMessage, max = MAX_BODY) {
     req.on('end', () => resolveBody(Buffer.concat(chunks).toString('utf8')))
     req.on('error', reject)
   })
+}
+
+function createSpoken() {
+  const flags: StreamFlags = { sawTextDelta: false, sawReasoningDelta: false }
+  let content = ''
+  let reasoning = ''
+  const tools: ToolTrace[] = []
+  let usage: Usage | null = null
+  let notice: string | null = null
+  let error: string | null = null
+  return {
+    note(event: unknown) {
+      applyJson(event, flags, {
+        onText: (delta) => {
+          content += delta
+        },
+        onReasoning: (delta) => {
+          reasoning += delta
+        },
+        onUsage: (value) => {
+          usage = value
+        },
+        onNotice: (value) => {
+          notice = value
+        },
+        onTool: (tool) => {
+          tools.push(tool)
+        },
+        onError: (message) => {
+          error = message
+        },
+      })
+    },
+    snapshot(stopped: boolean) {
+      return { content, reasoning, tools: [...tools], usage, notice, error, stopped }
+    },
+  }
+}
+
+function parseIncomingChat(value: unknown): Chat | null {
+  const parsed = parsePersistedState({ chats: [value], activeId: '' })
+  if (!parsed.ok || parsed.state.chats.length !== 1) return null
+  return parsed.state.chats[0]
 }
 
 function preview(text: string) {

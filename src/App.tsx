@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
-import { bootstrapChats, fetchProviders, isAbortError, modelHistory, resetChatsBootstrap, saveChats, streamChat } from './api.ts'
+import { bootstrapChats, createRemoteChat, deleteRemoteChat, fetchProviders, focusChat, isAbortError, resetChatsBootstrap, settleChatWrites, streamChat } from './api.ts'
 import { Composer } from './components/Composer.tsx'
 import { Sidebar } from './components/Sidebar.tsx'
 import { Thread } from './components/Thread.tsx'
 import { formatTokens, formatUsdFromTicks } from './format.ts'
-import { createChat, createMessage, titleFrom } from './storage.ts'
-import { EFFORTS, MAX_TOKEN_OPTIONS, type Chat, type ChatMessage, type Effort, type PersistedState, type ProviderInfo } from './types.ts'
+import { applyDrafts, createChat, createMessage, titleFrom, writeDraft } from './storage.ts'
+import { EFFORTS, MAX_TOKEN_OPTIONS, type Chat, type ChatMessage, type Effort, type ProviderInfo } from './types.ts'
 
 export function App() {
   const [chats, setChats] = useState<Chat[]>([])
@@ -16,18 +16,16 @@ export function App() {
   const [streamingChatId, setStreamingChatId] = useState<string | null>(null)
   const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
-  const latestRef = useRef<PersistedState | null>(null)
-  const saveTimerRef = useRef<number | null>(null)
+  const skipFocus = useRef(true)
 
   const active = chats.find((chat) => chat.id === activeId) ?? chats[0]
-  latestRef.current = status === 'ready' && active ? { chats, activeId: active.id } : null
 
   useEffect(() => {
     let cancelled = false
     bootstrapChats()
       .then((state) => {
         if (cancelled) return
-        setChats(state.chats)
+        setChats(applyDrafts(state.chats))
         setActiveId(state.activeId)
         setStatus('ready')
       })
@@ -40,36 +38,15 @@ export function App() {
   }, [attempt])
 
   useEffect(() => {
-    if (status !== 'ready' || !active) return
-    if (saveTimerRef.current !== null) return
-    saveTimerRef.current = window.setTimeout(() => {
-      saveTimerRef.current = null
-      const snapshot = latestRef.current
-      if (!snapshot) return
-      void saveChats(snapshot).catch((error: unknown) => {
-        console.error(error)
-      })
-    }, 300)
-  }, [status, chats, activeId, active])
-
-  useEffect(() => {
-    const flush = () => {
-      const snapshot = latestRef.current
-      if (!snapshot) return
-      void saveChats(snapshot).catch((error: unknown) => {
-        console.error(error)
-      })
+    if (status !== 'ready' || !activeId) return
+    if (skipFocus.current) {
+      skipFocus.current = false
+      return
     }
-    const onHide = () => {
-      if (document.visibilityState === 'hidden') flush()
-    }
-    document.addEventListener('visibilitychange', onHide)
-    window.addEventListener('pagehide', flush)
-    return () => {
-      document.removeEventListener('visibilitychange', onHide)
-      window.removeEventListener('pagehide', flush)
-    }
-  }, [])
+    void focusChat(activeId).catch((error: unknown) => {
+      console.error(error)
+    })
+  }, [status, activeId])
 
   useEffect(() => {
     let cancelled = false
@@ -108,6 +85,9 @@ export function App() {
     const chat = createChat(defaultModel())
     setChats((prev) => [chat, ...prev])
     setActiveId(chat.id)
+    void createRemoteChat(chat).catch((error: unknown) => {
+      console.error(error)
+    })
   }
 
   function removeChat(id: string) {
@@ -116,18 +96,26 @@ export function App() {
     if (!window.confirm(`Удалить «${target.title}»?`)) return
     if (streamingChatId === id) abortRef.current?.abort()
     const remaining = chats.filter((chat) => chat.id !== id)
+    writeDraft(id, '')
     if (remaining.length === 0) {
       const fresh = createChat(defaultModel())
       setChats([fresh])
       setActiveId(fresh.id)
-      return
+      void createRemoteChat(fresh).catch((error: unknown) => {
+        console.error(error)
+      })
+    } else {
+      setChats(remaining)
+      if (activeId === id) setActiveId(remaining[0].id)
     }
-    setChats(remaining)
-    if (activeId === id) setActiveId(remaining[0].id)
+    void deleteRemoteChat(id).catch((error: unknown) => {
+      console.error(error)
+    })
   }
 
   function patchActive(patch: Partial<Pick<Chat, 'model' | 'maxTokens' | 'reasoningEffort' | 'draft'>>) {
     if (!active) return
+    if (typeof patch.draft === 'string') writeDraft(active.id, patch.draft)
     setChats((prev) => prev.map((chat) => (chat.id === active.id ? { ...chat, ...patch } : chat)))
   }
 
@@ -149,9 +137,12 @@ export function App() {
     if (!text || streamingChatId) return
 
     const chatId = active.id
+    const model = active.model
+    const maxTokens = active.maxTokens
+    const reasoningEffort = active.reasoningEffort
     const userMessage = createMessage('user', text)
     const assistantMessage = createMessage('assistant', '')
-    const history = [...modelHistory(active.messages), { role: 'user' as const, content: text }]
+    writeDraft(chatId, '')
 
     setChats((prev) =>
       prev.map((chat) => {
@@ -172,12 +163,19 @@ export function App() {
     setStreamingMessageId(assistantMessage.id)
 
     try {
+      await settleChatWrites()
+      if (controller.signal.aborted) {
+        patchMessage(chatId, assistantMessage.id, (message) => ({ ...message, stopped: true }))
+        return
+      }
       await streamChat({
         chatId,
-        model: active.model,
-        maxTokens: active.maxTokens,
-        reasoningEffort: active.reasoningEffort,
-        messages: history,
+        model,
+        maxTokens,
+        reasoningEffort,
+        content: text,
+        userMessageId: userMessage.id,
+        assistantMessageId: assistantMessage.id,
         signal: controller.signal,
         onText: (delta) => patchMessage(chatId, assistantMessage.id, (message) => ({ ...message, content: message.content + delta })),
         onReasoning: (delta) =>

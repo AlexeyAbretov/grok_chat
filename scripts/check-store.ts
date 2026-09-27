@@ -1,5 +1,5 @@
 import { rmSync } from 'node:fs'
-import { chatDbPath, closeChatDb, readChats, writeChats } from '../server/store.ts'
+import { beginTurn, chatDbPath, closeChatDb, readChat, readChats, updateMessage, writeChats } from '../server/store.ts'
 import type { PersistedState } from '../shared/state.ts'
 
 process.env.CHAT_DB = 'data/store-check.sqlite'
@@ -77,6 +77,41 @@ if (JSON.stringify(canon(loaded)) !== JSON.stringify(canon(state))) {
   throw new Error('roundtrip')
 }
 
+const one = readChat(state.chats[0].id)
+if (!one || one.messages.length !== 2 || one.messages[1]?.content !== 'ответ' || one.messages[1].tools[0]?.name !== 'calc') {
+  throw new Error('readChat')
+}
+if (readChat('55555555-5555-4555-8555-555555555555')) throw new Error('missing chat')
+
+const started = beginTurn({
+  chatId: state.chats[0].id,
+  content: 'ещё вопрос',
+  userMessageId: '55555555-5555-4555-8555-555555555555',
+  assistantMessageId: '66666666-6666-4666-8666-666666666666',
+  model: 'grok',
+  maxTokens: 1024,
+  reasoningEffort: 'medium',
+})
+if (!started.ok) throw new Error('beginTurn')
+const turned = readChat(state.chats[0].id)
+if (!turned || turned.draft !== '' || turned.messages.length !== 4 || turned.messages[2]?.content !== 'ещё вопрос' || turned.messages[3]?.content !== '') {
+  throw new Error('turn stored')
+}
+const assistant = turned.messages[3]
+if (!assistant || !updateMessage(turned.id, { ...assistant, content: 'ответ 2', stopped: true })) throw new Error('updateMessage')
+const savedTurn = readChat(turned.id)
+if (savedTurn?.messages[3]?.content !== 'ответ 2' || savedTurn.messages[3]?.stopped !== true) throw new Error('assistant saved')
+const again = beginTurn({
+  chatId: turned.id,
+  content: 'ещё',
+  userMessageId: '55555555-5555-4555-8555-555555555555',
+  assistantMessageId: '77777777-7777-4777-8777-777777777777',
+  model: 'grok',
+  maxTokens: 1024,
+  reasoningEffort: 'low',
+})
+if (again.ok || again.reason !== 'duplicate') throw new Error('duplicate message')
+
 writeChats({ chats: [state.chats[1]], activeId: state.chats[1].id })
 const replaced = readChats()
 if (replaced.chats.length !== 1 || replaced.chats[0]?.id !== state.chats[1].id || replaced.chats[0].messages.length !== 0) {
@@ -98,21 +133,40 @@ function canon(value: unknown): unknown {
 const { startServer } = await import('../server/index.ts')
 const server = await startServer()
 try {
-  const saved = await fetch('http://127.0.0.1:8791/api/chats', {
-    method: 'PUT',
+  const replacedState = await (await fetch('http://127.0.0.1:8791/api/chats')).json()
+  const before = replacedState as { chats?: { id?: string }[] }
+  if (!Array.isArray(before.chats) || before.chats.length !== 1) throw new Error('http read')
+
+  const created = await fetch('http://127.0.0.1:8791/api/chats', {
+    method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(state),
+    body: JSON.stringify(state.chats[0]),
   })
-  if (!saved.ok) throw new Error(`put ${saved.status}`)
+  if (!created.ok) throw new Error(`post ${created.status}`)
+  const patched = await fetch(`http://127.0.0.1:8791/api/chats/${state.chats[0].id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ draft: 'ещё' }),
+  })
+  if (patched.status !== 405) throw new Error(`patch ${patched.status}`)
+  const focused = await fetch('http://127.0.0.1:8791/api/active', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ activeId: state.chats[0].id }),
+  })
+  if (!focused.ok) throw new Error(`active ${focused.status}`)
   const body: unknown = await (await fetch('http://127.0.0.1:8791/api/chats')).json()
-  if (JSON.stringify(canon(body)) !== JSON.stringify(canon(state))) throw new Error('http roundtrip')
+  const loadedHttp = body as { activeId?: string; chats?: { id?: string; draft?: string }[] }
+  if (loadedHttp.activeId !== state.chats[0].id || loadedHttp.chats?.[0]?.id !== state.chats[0].id || loadedHttp.chats[0]?.draft !== 'черновик') {
+    throw new Error('http chat')
+  }
 
   const rejected = await fetch('http://127.0.0.1:8791/api/chats', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chats: [], activeId: '' }),
+    body: JSON.stringify(state),
   })
-  if (rejected.status !== 400) throw new Error(`empty ${rejected.status}`)
+  if (rejected.status !== 405) throw new Error(`put ${rejected.status}`)
   console.log(`ok ${chatDbPath()}`)
 } finally {
   await new Promise<void>((resolveClose, rejectClose) => {

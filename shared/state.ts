@@ -135,3 +135,10 @@ function timestamp(value: unknown, fallback: number) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
   return Math.trunc(value)
 }
+
+export function titleFrom(text: string) {
+  const line = text.trim().replace(/\s+/g, ' ')
+  if (!line) return 'Новый чат'
+  if (line.length <= 42) return line
+  return `${line.slice(0, 42).trimEnd()}…`
+}

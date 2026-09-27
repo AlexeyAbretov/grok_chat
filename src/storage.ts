@@ -1,6 +1,7 @@
 import { parsePersistedState, type Chat, type ChatMessage, type PersistedState } from '../shared/state.ts'
 
 const STORAGE_KEY = 'grok-chat.v1'
+const DRAFTS_KEY = 'grok-chat.drafts'
 
 export function createChat(model = ''): Chat {
   const now = Date.now()
@@ -31,12 +32,7 @@ export function createMessage(role: ChatMessage['role'], content: string): ChatM
   }
 }
 
-export function titleFrom(text: string) {
-  const line = text.trim().replace(/\s+/g, ' ')
-  if (!line) return 'Новый чат'
-  if (line.length <= 42) return line
-  return `${line.slice(0, 42).trimEnd()}…`
-}
+export { titleFrom } from '../shared/state.ts'
 
 export function clearStoredApiKeys() {
   try {
@@ -57,6 +53,38 @@ export function readLegacyState(): PersistedState | null {
     return state.state
   } catch {
     return null
+  }
+}
+
+export function applyDrafts(chats: Chat[]): Chat[] {
+  const drafts = readDrafts()
+  return chats.map((chat) => ({ ...chat, draft: drafts[chat.id] ?? '' }))
+}
+
+export function writeDraft(chatId: string, draft: string) {
+  const drafts = readDrafts()
+  if (draft) drafts[chatId] = draft
+  else delete drafts[chatId]
+  try {
+    sessionStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts))
+  } catch {
+    // Private mode can block storage; the draft stays in memory for this page.
+  }
+}
+
+function readDrafts(): Record<string, string> {
+  try {
+    const raw = sessionStorage.getItem(DRAFTS_KEY)
+    if (!raw) return {}
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const drafts: Record<string, string> = {}
+    for (const [id, value] of Object.entries(parsed)) {
+      if (typeof value === 'string') drafts[id] = value
+    }
+    return drafts
+  } catch {
+    return {}
   }
 }
 

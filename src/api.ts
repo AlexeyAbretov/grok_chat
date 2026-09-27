@@ -1,51 +1,16 @@
-import { parsePersistedState, type PersistedState } from '../shared/state.ts'
+import { parsePersistedState, type Chat, type PersistedState } from '../shared/state.ts'
 import { applyJson, applySseEvent, errorText, splitSse, type StreamFlags, type StreamHandlers } from '../shared/sse.ts'
 import { clearLegacyState, clearStoredApiKeys, createChat, readLegacyState } from './storage.ts'
 import type { Effort, ProviderInfo } from './types.ts'
-
-export type ChatTurn = {
-  role: 'user' | 'assistant'
-  content: string
-}
-
-type HistoryMessage = {
-  role: 'user' | 'assistant'
-  content: string
-  tools?: readonly { name: string; args?: string; ok: boolean; output: string }[]
-}
-
-export function modelHistory(messages: readonly HistoryMessage[]): ChatTurn[] {
-  const turns: ChatTurn[] = []
-  for (const message of messages) {
-    if (message.role === 'user') {
-      turns.push({ role: 'user', content: message.content })
-      continue
-    }
-    if (message.content.trim()) {
-      turns.push({ role: 'assistant', content: message.content })
-      continue
-    }
-    const tools = message.tools ?? []
-    if (tools.length === 0) continue
-    turns.push({
-      role: 'assistant',
-      content: tools
-        .map((tool) => {
-          const args = tool.args ? ` ${tool.args}` : ''
-          return tool.ok ? `${tool.name}${args}: ${tool.output}` : `${tool.name}${args}: ошибка: ${tool.output}`
-        })
-        .join('\n'),
-    })
-  }
-  return turns
-}
 
 type StreamChatOptions = Omit<StreamHandlers, 'onError'> & {
   chatId: string
   model: string
   maxTokens: number
   reasoningEffort: Effort
-  messages: ChatTurn[]
+  content: string
+  userMessageId: string
+  assistantMessageId: string
   signal: AbortSignal
 }
 
@@ -84,7 +49,9 @@ export async function streamChat(options: StreamChatOptions) {
       model: options.model,
       maxTokens: options.maxTokens,
       reasoningEffort: options.reasoningEffort,
-      messages: options.messages,
+      content: options.content,
+      userMessageId: options.userMessageId,
+      assistantMessageId: options.assistantMessageId,
     }),
     signal: options.signal,
   })
@@ -145,8 +112,7 @@ export function isAbortError(error: unknown) {
 }
 
 let chatsBootstrap: Promise<PersistedState> | null = null
-let saveChain: Promise<void> = Promise.resolve()
-let savedBody = ''
+let writeChain: Promise<void> = Promise.resolve()
 
 export function resetChatsBootstrap() {
   chatsBootstrap = null
@@ -162,29 +128,25 @@ export function bootstrapChats() {
 
 async function loadChats(): Promise<PersistedState> {
   clearStoredApiKeys()
-  const remote = await fetchChats()
+  let remote = await fetchChats()
   const legacy = readLegacyState()
   if (legacy) {
-    const merged = mergeLegacy(remote, legacy)
-    if (merged) await saveChats(merged)
+    const known = new Set(remote.chats.map((chat) => chat.id))
+    const imported = remote.chats.length === 0 ? legacy.chats : legacy.chats.filter((chat) => !known.has(chat.id))
+    for (let index = imported.length - 1; index >= 0; index -= 1) {
+      const chat = imported[index]
+      if (chat) await createRemoteChat(chat)
+    }
+    const activeId = imported.some((chat) => chat.id === legacy.activeId) ? legacy.activeId : remote.activeId
+    if (activeId) await focusChat(activeId)
     clearLegacyState()
-    if (merged) return merged
-    if (remote.chats.length > 0) return remote
+    remote = await fetchChats()
   }
   if (remote.chats.length > 0) return remote
   const chat = createChat()
-  const fresh = { chats: [chat], activeId: chat.id }
-  await saveChats(fresh)
-  return fresh
-}
-
-function mergeLegacy(remote: PersistedState, legacy: PersistedState): PersistedState | null {
-  const known = new Set(remote.chats.map((chat) => chat.id))
-  const extra = legacy.chats.filter((chat) => !known.has(chat.id))
-  if (remote.chats.length === 0) return legacy
-  if (extra.length === 0) return null
-  const activeId = extra.some((chat) => chat.id === legacy.activeId) ? legacy.activeId : remote.activeId
-  return { chats: [...extra, ...remote.chats], activeId }
+  await createRemoteChat(chat)
+  await focusChat(chat.id)
+  return { chats: [chat], activeId: chat.id }
 }
 
 async function fetchChats(): Promise<PersistedState> {
@@ -195,31 +157,43 @@ async function fetchChats(): Promise<PersistedState> {
   return parsed.state
 }
 
-export function saveChats(state: PersistedState) {
-  const body = JSON.stringify(state)
-  if (body === savedBody) return Promise.resolve()
-  const run = saveChain.then(async () => {
-    if (body === savedBody) return
-    const response = await fetch('/api/chats', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body,
-      keepalive: body.length <= 60_000,
-    })
-    if (!response.ok) {
-      let message = `Ошибка ${response.status}`
-      try {
-        message = errorText(await response.json()) ?? message
-      } catch {
-        // The body was not JSON; the status line is enough.
-      }
-      throw new Error(message)
-    }
-    savedBody = body
-  })
-  saveChain = run.then(
+export function settleChatWrites() {
+  return writeChain
+}
+
+export function createRemoteChat(chat: Chat) {
+  return enqueue(() => sendJson('/api/chats', 'POST', chat))
+}
+
+export function deleteRemoteChat(id: string) {
+  return enqueue(() => sendJson(`/api/chats/${id}`, 'DELETE'))
+}
+
+export function focusChat(id: string) {
+  return enqueue(() => sendJson('/api/active', 'POST', { activeId: id }))
+}
+
+function enqueue(task: () => Promise<void>) {
+  const run = writeChain.then(task, task)
+  writeChain = run.then(
     () => undefined,
     () => undefined,
   )
   return run
+}
+
+async function sendJson(url: string, method: string, body?: unknown) {
+  const response = await fetch(url, {
+    method,
+    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  if (response.ok) return
+  let message = `Ошибка ${response.status}`
+  try {
+    message = errorText(await response.json()) ?? message
+  } catch {
+    // The body was not JSON; the status line is enough.
+  }
+  throw new Error(message)
 }

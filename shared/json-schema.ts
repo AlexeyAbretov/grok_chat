@@ -17,17 +17,14 @@ export type SchemaIssue =
   | { kind: 'value'; path: string }
   | { kind: 'missing'; path: string }
 
-export type ChatRequestMessage = {
-  role: 'user' | 'assistant'
-  content: string
-}
-
 export type ChatRequest = {
   chatId: string
   model: string
   reasoningEffort: Effort
   maxTokens: number
-  messages: ChatRequestMessage[]
+  content: string
+  userMessageId: string
+  assistantMessageId: string
 }
 
 const effortIds = EFFORTS.map((item) => item.id)
@@ -35,24 +32,15 @@ const effortIds = EFFORTS.map((item) => item.id)
 export const json_schema: JsonSchema = {
   type: 'object',
   additionalProperties: false,
-  required: ['chatId', 'model', 'reasoningEffort', 'maxTokens', 'messages'],
+  required: ['chatId', 'model', 'reasoningEffort', 'maxTokens', 'content', 'userMessageId', 'assistantMessageId'],
   properties: {
     chatId: { type: 'string' },
     model: { type: 'string' },
     reasoningEffort: { type: 'string', enum: effortIds },
     maxTokens: { type: 'integer', minimum: 1, maximum: 128_000 },
-    messages: {
-      type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['role', 'content'],
-        properties: {
-          role: { type: 'string', enum: ['user', 'assistant'] },
-          content: { type: 'string' },
-        },
-      },
-    },
+    content: { type: 'string' },
+    userMessageId: { type: 'string' },
+    assistantMessageId: { type: 'string' },
   },
 }
 
@@ -83,26 +71,23 @@ export function parseChatRequest(raw: string): { ok: true; request: ChatRequest 
   const model = parsed.value.model
   const reasoningEffort = parsed.value.reasoningEffort
   const maxTokens = parsed.value.maxTokens
-  const messages = parsed.value.messages
+  const content = parsed.value.content
+  const userMessageId = parsed.value.userMessageId
+  const assistantMessageId = parsed.value.assistantMessageId
   if (!isChatId(chatId)) return { ok: false, message: 'Недопустимое значение «chatId»' }
   if (!isModel(model)) return { ok: false, message: 'Недопустимое значение «model»' }
-  if (!isEffort(reasoningEffort) || typeof maxTokens !== 'number' || !Array.isArray(messages)) {
+  if (!isEffort(reasoningEffort) || typeof maxTokens !== 'number' || typeof content !== 'string') {
     return { ok: false, message: 'Недопустимое значение «тело»' }
   }
-
-  const typedMessages: ChatRequestMessage[] = []
-  for (const message of messages) {
-    if (!isRecord(message) || (message.role !== 'user' && message.role !== 'assistant') || typeof message.content !== 'string') {
-      return { ok: false, message: 'Неверный тип «messages»' }
-    }
-    if (!message.content.trim()) return { ok: false, message: 'Пустое сообщение' }
-    typedMessages.push({ role: message.role, content: message.content })
+  if (!content.trim()) return { ok: false, message: 'Пустое сообщение' }
+  if (!isChatId(userMessageId)) return { ok: false, message: 'Недопустимое значение «userMessageId»' }
+  if (!isChatId(assistantMessageId) || assistantMessageId === userMessageId) {
+    return { ok: false, message: 'Недопустимое значение «assistantMessageId»' }
   }
-  if (typedMessages.length === 0) return { ok: false, message: 'Пустое сообщение' }
 
   return {
     ok: true,
-    request: { chatId, model, reasoningEffort, maxTokens, messages: typedMessages },
+    request: { chatId, model, reasoningEffort, maxTokens, content: content.trim(), userMessageId, assistantMessageId },
   }
 }
 
