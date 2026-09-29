@@ -1,0 +1,131 @@
+[
+  {
+    "question": "Что увидит человек, если попробует получить результат деления, записав во второй аргумент нулевое значение?",
+    "document": "corpus/docs/calc-zero.md",
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Сколько исходных величин умеет принять арифметический инструмент, и берётся ли он за целую формулу?",
+    "document": "corpus/docs/calc-pair.md",
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Можно ли чтению выйти из папки с заметками и открыть секрет окружения уровнем выше?",
+    "document": "corpus/docs/notes-path.md",
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Как зовётся населённый пункт, через который протекает река Нева?",
+    "document": "corpus/docs/neva.md",
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Зачем при нарезке длинного текста соседние куски немного накладываются?",
+    "document": "corpus/docs/chunk-window.md",
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Почему в ответ языковой модели отдают не одну найденную строку, а весь блок под заголовком вокруг неё?",
+    "document": "corpus/docs/parent-piece.md",
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Почему нельзя просто сложить сырые оценки двух поисков, и что используют вместо этого?",
+    "document": "corpus/docs/rrf-merge.md",
+    "kind": "paraphrase"
+  },
+  {
+    "question": "В какой момент отбрасывают записи чужой полки и чужой даты — до сравнения плотных представлений или после?",
+    "document": "corpus/docs/meta-before.md",
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Что нужно проверить в выдаче до того, как подключать ту, которая пишет формулировку?",
+    "document": "corpus/docs/recall-gate.md",
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Как следует поступить, если среди подложенных кусков нет факта, о котором спросили?",
+    "document": "corpus/docs/cite-rule.md",
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Какой поиск находит текст, пересказанный иными формулировками, даже если редкие термины не совпали?",
+    "document": "corpus/docs/dense-para.md",
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Когда имеет смысл просить сформулировать ответ по уже найденным кускам?",
+    "document": "corpus/docs/gen-after.md",
+    "kind": "paraphrase"
+  },
+  {
+    "question": "--no-verify",
+    "document": "corpus/docs/git-hook.md",
+    "kind": "exact"
+  },
+  {
+    "question": "ENOENT",
+    "document": "corpus/docs/errno-enoent.md",
+    "kind": "exact"
+  },
+  {
+    "question": "SKU-4419",
+    "document": "corpus/docs/sku-4419.md",
+    "kind": "exact"
+  },
+  {
+    "question": "search_notes",
+    "document": "corpus/docs/tool-search.md",
+    "kind": "exact"
+  },
+  {
+    "question": "XAI_API_KEY",
+    "document": "corpus/docs/env-xai.md",
+    "kind": "exact"
+  },
+  {
+    "question": "8787",
+    "document": "corpus/docs/listen-port.md",
+    "kind": "exact"
+  },
+  {
+    "question": "text-embedding-3-small",
+    "document": "corpus/docs/embed-id.md",
+    "kind": "exact"
+  },
+  {
+    "question": "RRF_K",
+    "document": "corpus/docs/rrf-const.md",
+    "kind": "exact"
+  },
+  {
+    "question": "АРТ-17-Б",
+    "document": "corpus/docs/art-17.md",
+    "kind": "exact"
+  },
+  {
+    "question": "ZX_FLAG_QUORUM",
+    "document": "corpus/docs/rare-flag.md",
+    "kind": "exact"
+  },
+  {
+    "question": "wl-9f3a",
+    "document": "corpus/docs/trace-id.md",
+    "kind": "exact"
+  },
+  {
+    "question": "eval-rag.ts",
+    "document": "corpus/docs/eval-script.md",
+    "kind": "exact"
+  },
+  {
+    "question": "TPM-48000",
+    "document": "corpus/docs/quota-2026.md",
+    "kind": "exact",
+    "filter": {
+      "section": "billing",
+      "dateFrom": "2026-01-01"
+    }
+  }
+]

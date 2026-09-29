@@ -11,6 +11,7 @@ import { beginTurn, chatDbPath, closeChatDb, deleteChat, insertChat, openChatDb,
 import { createLlmLog } from './llm-log.ts'
 import { llmForModel, providerStatus } from './providers/index.ts'
 import type { ChatInputMessage } from './providers/types.ts'
+import { corpusContext } from './rag/corpus.ts'
 import { chatTools, noteNames, runTool } from './tools/index.ts'
 import { apiErrorRecord, MAX_COST_TICKS } from './agent.ts'
 import { createAgentRun, runAgentGraph } from './agent-graph.ts'
@@ -212,19 +213,35 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
     return
   }
 
-  const input: ChatInputMessage[] = [{ role: 'system', content: provider.systemPrompt }, ...history]
   const llm = createLlmLog(chatId)
   llm.line(`файл logs/${chatId}.log`)
+  const upstreamAbort = new AbortController()
+  res.on('close', () => {
+    if (!res.writableEnded) upstreamAbort.abort()
+  })
+
+  let system = provider.systemPrompt
+  try {
+    // Найденные фрагменты корпуса дописываются в промпт до вызова модели.
+    const corpus = await corpusContext(latest.content, upstreamAbort.signal)
+    if (upstreamAbort.signal.aborted || res.destroyed) return
+    if (corpus) {
+      system = `${provider.systemPrompt}\n\n${corpus.text}`
+      llm.line(`корпус: ${corpus.mode}, фрагментов ${corpus.count}${corpus.warning ? `, ${corpus.warning}` : ''}`)
+    } else {
+      llm.line('корпус: нет фрагментов')
+    }
+  } catch (error) {
+    if (upstreamAbort.signal.aborted || res.destroyed) return
+    llm.line(`корпус: ${error instanceof Error ? error.message : 'ошибка'}`)
+  }
+
+  const input: ChatInputMessage[] = [{ role: 'system', content: system }, ...history]
   const offered = chatTools()
   const notes = noteNames()
   llm.line(`→ ${provider.id}/${model}, tools: ${offered.map((tool) => tool.name).join(', ')}`)
   llm.line(`заметки: ${notes.length ? notes.join(', ') : 'нет файлов'}`)
   llm.items(input)
-
-  const upstreamAbort = new AbortController()
-  res.on('close', () => {
-    if (!res.writableEnded) upstreamAbort.abort()
-  })
 
   let streaming = false
   let failure: string | null = null
