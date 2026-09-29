@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { parseJsonText } from '../shared/json-schema.ts'
 import type { Usage } from '../shared/protocol.ts'
 import { extractOutput } from '../shared/sse.ts'
-import { runTool } from './tools.ts'
+import { runTool } from './tools/index.ts'
 import type { ExecutedTool, FunctionCall } from './turn.ts'
 
 const TICKS_PER_USD = 10_000_000_000

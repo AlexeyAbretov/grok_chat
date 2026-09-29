@@ -1,7 +1,7 @@
 import type { StateSnapshot } from '@langchain/langgraph'
 import { MAX_COST_TICKS } from '../server/agent.ts'
 import { agentGraph, agentSnapshots, bindAgentDeps, createAgentRun, runHandwrittenAgent, type AgentDeps, type AgentRun, type ModelResult } from '../server/agent-graph.ts'
-import { runTool } from '../server/tools.ts'
+import { runTool } from '../server/tools/index.ts'
 
 function assert(condition: unknown, message: string) {
   if (!condition) throw new Error(message)

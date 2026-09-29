@@ -11,7 +11,7 @@ import { beginTurn, chatDbPath, closeChatDb, deleteChat, insertChat, openChatDb,
 import { createLlmLog } from './llm-log.ts'
 import { llmForModel, providerStatus } from './providers/index.ts'
 import type { ChatInputMessage } from './providers/types.ts'
-import { chatTools, noteNames, runTool } from './tools.ts'
+import { chatTools, noteNames, runTool } from './tools/index.ts'
 import { apiErrorRecord, MAX_COST_TICKS } from './agent.ts'
 import { createAgentRun, runAgentGraph } from './agent-graph.ts'
 import { usageToApi } from './turn.ts'
