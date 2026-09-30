@@ -13,6 +13,7 @@ import { llmForModel, providerStatus } from './providers/index.ts'
 import type { ChatInputMessage } from './providers/types.ts'
 // corpusContext ищет фрагменты корпуса по последнему вопросу и возвращает текст для системного промпта.
 import { corpusContext } from './rag/corpus.ts'
+import { closeSharedMcp, sharedMcp, type McpHandle } from './mcp/client.ts'
 import { chatTools, noteNames, runTool } from './tools/index.ts'
 import { apiErrorRecord, MAX_COST_TICKS } from './agent.ts'
 import { createAgentRun, runAgentGraph } from './agent-graph.ts'
@@ -47,10 +48,12 @@ export function startServer() {
   })
 
   server.on('close', () => {
+    closeSharedMcp()
     closeChatDb()
   })
 
   server.on('error', (error: NodeJS.ErrnoException) => {
+    closeSharedMcp()
     closeChatDb()
     if (error.code === 'EADDRINUSE') {
       console.error(`Порт ${PORT} уже занят`)
@@ -217,6 +220,11 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
   const llm = createLlmLog(chatId)
   llm.line(`файл logs/${chatId}.log`)
   const upstreamAbort = new AbortController()
+  // Подключение к MCP идёт вместе с поиском по корпусу: схема инструментов не нужна, пока модель не вызвана.
+  const foreignPromise = sharedMcp().catch((error: unknown) => {
+    llm.line(`mcp: ${error instanceof Error ? error.message : 'не удалось подключиться'}`)
+    return null
+  })
   res.on('close', () => {
     if (!res.writableEnded) upstreamAbort.abort()
   })
@@ -244,10 +252,14 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
     llm.line(`корпус: ${error instanceof Error ? error.message : 'ошибка'}`)
   }
 
+  const foreign = await foreignPromise
+  if (upstreamAbort.signal.aborted || res.destroyed) return
   const input: ChatInputMessage[] = [{ role: 'system', content: system }, ...history]
-  const offered = chatTools()
+  // Локальные инструменты недели 3 плюс схемы, которые прислал сервер MCP. Имена сервера цикл сам не выдумывает.
+  const offered = [...chatTools(), ...(foreign?.tools ?? [])]
   const notes = noteNames()
   llm.line(`→ ${provider.id}/${model}, tools: ${offered.map((tool) => tool.name).join(', ')}`)
+  if (foreign) llm.line(`mcp: ${foreign.direct ? 'прямой вызов' : 'сервер'}`)
   llm.line(`заметки: ${notes.length ? notes.join(', ') : 'нет файлов'}`)
   llm.items(input)
 
@@ -294,7 +306,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
         })
         return { turn, latencyMs: Math.round(performance.now() - started), streaming: startedStream }
       },
-      runTool: (name, args) => runTool(name, args),
+      runTool: (name, args) => callOfferedTool(foreign, name, args, upstreamAbort.signal),
       toolOutputs: (results) => provider.toolOutputs(results),
       onRound: (step) => llm.line(`→ раунд ${step}`),
       onTurn: llm.turn,
@@ -453,6 +465,18 @@ function parseIncomingChat(value: unknown): Chat | null {
   const parsed = parsePersistedState({ chats: [value], activeId: '' })
   if (!parsed.ok || parsed.state.chats.length !== 1) return null
   return parsed.state.chats[0]
+}
+
+/**
+ * Имя из списка MCP уходит на сервер. Остальные инструменты — локальные функции недели 3.
+ * Обрыв соединения пробрасывается дальше, чтобы цикл не делал следующий шаг. Сбой протокола — ошибка инструмента.
+ */
+function callOfferedTool(foreign: McpHandle | null, name: string, args: unknown, signal: AbortSignal) {
+  if (!foreign?.names.has(name)) return runTool(name, args)
+  return foreign.call(name, args, signal).catch((error: unknown) => {
+    if (signal.aborted) throw error
+    return { ok: false as const, output: error instanceof Error ? error.message : 'MCP недоступен' }
+  })
 }
 
 function preview(text: string) {

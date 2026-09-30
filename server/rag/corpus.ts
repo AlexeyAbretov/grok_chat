@@ -20,6 +20,7 @@ import {
   type Chunk,
   type Document,
   type GoldQuestion,
+  type Passage,
   type SearchFilter,
   type SearchMode,
 } from './types.ts'
@@ -128,12 +129,19 @@ export function expandQuery(query: string) {
   return hasPlace ? `${query} ячейка` : query
 }
 
+/** Найденные фрагменты корпуса. mode пишет лог: bm25, hybrid или hybrid+rerank. */
+export type CorpusSearch = {
+  passages: Passage[]
+  mode: string
+  warning: string | null
+}
+
 /**
- * Текст, который дописывается в системный промпт перед ответом модели.
- * Пустой вопрос и пустой корпус дают null: промпт остаётся обычным.
- * Возвращает ещё режим поиска и предупреждение, их пишет лог сервера.
+ * Ищет фрагменты по вопросу. Тот же порядок, что у чата: синоним, индекс, реранк, пять секций.
+ * null — вопрос пустой или в корпусе нет файлов. Пустой passages значит «поиск был, совпадений нет».
+ * Инструмент MCP отдаёт этот результат как данные. В промпт его кладёт corpusContext.
  */
-export async function corpusContext(question: string, signal?: AbortSignal) {
+export async function searchPassages(question: string, signal?: AbortSignal): Promise<CorpusSearch | null> {
   const trimmed = question.trim()
   if (!trimmed) return null
   // Синоним дописываем до эмбеддинга и до BM25.
@@ -164,12 +172,21 @@ export async function corpusContext(question: string, signal?: AbortSignal) {
     const chunk = byId.get(id)
     return chunk ? [chunk] : []
   })
-  // Несколько окон одной секции здесь схлопываются в один фрагмент.
-  const passages = passagesFromChunks(hits)
-  const text = passagesPrompt(passages)
+  return { passages: passagesFromChunks(hits), mode: rerank ? 'hybrid+rerank' : mode, warning: index.warning }
+}
+
+/**
+ * Текст, который дописывается в системный промпт перед ответом модели.
+ * Пустой вопрос, пустой корпус и пустая выдача дают null: промпт остаётся обычным.
+ * Возвращает ещё режим поиска и предупреждение, их пишет лог сервера.
+ */
+export async function corpusContext(question: string, signal?: AbortSignal) {
+  const found = await searchPassages(question, signal)
+  if (!found) return null
+  // Несколько окон одной секции уже схлопнуты. Пустой текст — в промпт нечего дописывать.
+  const text = passagesPrompt(found.passages)
   if (!text) return null
-  // mode в логе отличает гибрид с реранком от голого гибрида и от одного BM25.
-  return { text, mode: rerank ? 'hybrid+rerank' : mode, count: passages.length, warning: index.warning }
+  return { text, mode: found.mode, count: found.passages.length, warning: found.warning }
 }
 
 /**

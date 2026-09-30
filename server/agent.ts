@@ -47,6 +47,9 @@ export type StepRecord = {
 
 export type AgentToolStop = null | 'tool' | 'truncated' | 'duplicate_tool' | 'tool_mismatch'
 
+/** Локальный инструмент возвращает результат сразу. Вызов MCP ждёт ответ процесса, поэтому функция может быть асинхронной. */
+export type ToolRunner = (name: string, args: unknown) => { ok: boolean; output: string } | Promise<{ ok: boolean; output: string }>
+
 export function createAgentState(model: string, requestId: string = randomUUID()): AgentState {
   return {
     requestId,
@@ -101,14 +104,14 @@ export function agentBlock(agent: AgentState): 'max_cost' | 'max_tool_rounds' | 
   return null
 }
 
-export function runAgentTools(
+export async function runAgentTools(
   agent: AgentState,
   calls: readonly FunctionCall[],
-  run: (name: string, args: unknown) => { ok: boolean; output: string },
+  run: ToolRunner,
   latencyMs: number,
   turnUsage: Usage | null,
   text: string | null = null,
-): { stop: AgentToolStop; executed: ExecutedTool[]; records: StepRecord[] } {
+): Promise<{ stop: AgentToolStop; executed: ExecutedTool[]; records: StepRecord[] }> {
   const executed: ExecutedTool[] = []
   const records: StepRecord[] = []
   let charged = false
@@ -129,7 +132,7 @@ export function runAgentTools(
       records.push(stepRecord(agent, call.name, call.arguments, null, null, billed.latency, billed.usage, 'duplicate_tool', billed.text))
       return { stop: 'duplicate_tool', executed, records }
     }
-    const result = run(call.name, parsed.value)
+    const result = await run(call.name, parsed.value)
     rememberCall(agent, call.name, call.arguments)
     executed.push({
       callId: call.callId,

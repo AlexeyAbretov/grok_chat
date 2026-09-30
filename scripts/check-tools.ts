@@ -228,7 +228,7 @@ const longArgs = JSON.stringify({ query: longQuery })
 assert(!formatLlmItem({ type: 'function_call', name: 'search_notes', arguments: longArgs }).includes(longQuery), 'the text log still clips long arguments')
 const traced = createAgentState('grok-test', 'req-long')
 traced.step = 1
-const longRun = runAgentTools(
+const longRun = await runAgentTools(
   traced,
   [{ callId: '1', name: 'search_notes', arguments: longArgs }],
   () => ({ ok: true, output: longQuery }),
@@ -294,7 +294,7 @@ let searches = 0
 const searchAgent = createAgentState('grok-test', 'req-search')
 searchAgent.step = 1
 const city = runTool('search_notes', { query: 'город' })
-const firstSearch = runAgentTools(
+const firstSearch = await runAgentTools(
   searchAgent,
   [{ callId: '1', name: 'search_notes', arguments: '{"query":"город"}' }],
   () => {
@@ -304,7 +304,7 @@ const firstSearch = runAgentTools(
   20,
   null,
 )
-const repeatSearch = runAgentTools(
+const repeatSearch = await runAgentTools(
   searchAgent,
   [{ callId: '2', name: 'search_notes', arguments: '{ "query" : "город" }' }],
   () => {
@@ -323,7 +323,7 @@ assert(blockedCall.arguments === '{ "query" : "город" }' && blockedCall.out
 
 const honest = createAgentState('grok-test', 'req-honest')
 honest.step = 1
-const honestRun = runAgentTools(
+const honestRun = await runAgentTools(
   honest,
   [{ callId: '1', name: 'calculator', arguments: '{"op":"add","a":2,"b":3}' }],
   (name, args) => runTool(name, args),
@@ -335,7 +335,7 @@ assert(honestRun.stop === null && honestRun.executed[0]?.output === '{"result":5
 let lies = 0
 const liar = createAgentState('grok-test', 'req-lie')
 liar.step = 2
-const lied = runAgentTools(
+const lied = await runAgentTools(
   liar,
   [{ callId: '1', name: 'calculator', arguments: '{"op":"add","a":2,"b":3}' }],
   () => {
@@ -345,7 +345,7 @@ const lied = runAgentTools(
   8,
   { inputTokens: 1, outputTokens: 1, reasoningTokens: null, cachedTokens: null, totalTokens: 2, costTicks: 3 },
 )
-const repeatedLie = runAgentTools(
+const repeatedLie = await runAgentTools(
   liar,
   [{ callId: '3', name: 'calculator', arguments: '{"b":3,"a":2,"op":"add"}' }],
   () => {
@@ -363,7 +363,7 @@ assert(repeatedLie.stop === 'duplicate_tool' && lies === 1, 'the same lying call
 
 const zeroAgent = createAgentState('grok-test', 'req-zero')
 zeroAgent.step = 1
-const zeroStop = runAgentTools(
+const zeroStop = await runAgentTools(
   zeroAgent,
   [{ callId: '1', name: 'calculator', arguments: '{"op":"div","a":1,"b":0}' }],
   (name, args) => runTool(name, args),
@@ -375,7 +375,7 @@ assert(zeroStop.stop === 'tool' && zeroStop.records[0]?.stop === null, 'division
 const pairAgent = createAgentState('grok-test', 'req-pair')
 pairAgent.step = 1
 const pairUsage = { inputTokens: 9, outputTokens: 8, reasoningTokens: null, cachedTokens: null, totalTokens: 17, costTicks: 40 }
-const paired = runAgentTools(
+const paired = await runAgentTools(
   pairAgent,
   [
     { callId: '1', name: 'calculator', arguments: '{"op":"add","a":2,"b":3}' },
@@ -395,7 +395,7 @@ assert(secondBill.cost_ticks === null && secondBill.latency_ms === null && secon
 
 const fileLiar = createAgentState('grok-test', 'req-file')
 fileLiar.step = 1
-const fileLie = runAgentTools(
+const fileLie = await runAgentTools(
   fileLiar,
   [{ callId: '1', name: 'read_file', arguments: '{"path":"a.md"}' }],
   () => ({ ok: true, output: '{"path":"a.md","content":"нет такого","truncated":false}' }),
@@ -406,7 +406,7 @@ assert(fileLie.stop === 'tool_mismatch' && fileLie.records[0]?.ok === true, 'a f
 
 const fileHonest = createAgentState('grok-test', 'req-file-ok')
 fileHonest.step = 1
-const fileOk = runAgentTools(
+const fileOk = await runAgentTools(
   fileHonest,
   [{ callId: '1', name: 'read_file', arguments: '{"path":"a.md"}' }],
   (name, args) => runTool(name, args),
@@ -417,7 +417,7 @@ assert(fileOk.stop === null && fileOk.executed[0]?.output.includes('Кальку
 
 const searchLiar = createAgentState('grok-test', 'req-search-lie')
 searchLiar.step = 1
-const searchLie = runAgentTools(
+const searchLie = await runAgentTools(
   searchLiar,
   [{ callId: '1', name: 'search_notes', arguments: '{"query":"Калькулятор"}' }],
   () => ({ ok: true, output: '{"matches":[],"truncated":false}' }),

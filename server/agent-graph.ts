@@ -12,6 +12,7 @@ import {
   runAgentTools,
   type AgentCall,
   type StepRecord,
+  type ToolRunner,
 } from './agent.ts'
 import type { StreamTurnResult, ToolExchange } from './providers/types.ts'
 import { addUsage, planToolRound, type ExecutedTool, type FunctionCall } from './turn.ts'
@@ -62,7 +63,7 @@ export type ModelResult = {
 export type AgentDeps = {
   signal?: AbortSignal
   callModel: (state: AgentRun) => Promise<ModelResult>
-  runTool: (name: string, args: unknown) => { ok: boolean; output: string }
+  runTool: ToolRunner
   toolOutputs: (results: readonly ToolExchange[]) => unknown[]
   onRound?: (step: number) => void
   onTurn?: (
@@ -258,7 +259,7 @@ async function applyTools(state: AgentRun, deps: AgentDeps): Promise<AgentRun> {
   const next = cloneRun(state)
   const pending = next.pending
   if (!pending) throw new Error('Нет вызова для инструментов')
-  const tools = runAgentTools(next, pending.calls, deps.runTool, pending.latencyMs, pending.usage, pending.text)
+  const tools = await runAgentTools(next, pending.calls, deps.runTool, pending.latencyMs, pending.usage, pending.text)
   for (const item of tools.executed) {
     next.trace.push({ name: item.name, arguments: item.arguments, ok: item.ok, output: item.output })
   }
