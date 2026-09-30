@@ -11,6 +11,7 @@ import { beginTurn, chatDbPath, closeChatDb, deleteChat, insertChat, openChatDb,
 import { createLlmLog } from './llm-log.ts'
 import { llmForModel, providerStatus } from './providers/index.ts'
 import type { ChatInputMessage } from './providers/types.ts'
+// corpusContext ищет фрагменты корпуса по последнему вопросу и возвращает текст для системного промпта.
 import { corpusContext } from './rag/corpus.ts'
 import { chatTools, noteNames, runTool } from './tools/index.ts'
 import { apiErrorRecord, MAX_COST_TICKS } from './agent.ts'
@@ -220,18 +221,25 @@ async function handleChat(req: IncomingMessage, res: ServerResponse) {
     if (!res.writableEnded) upstreamAbort.abort()
   })
 
+  // Обычные инструкции провайдера. Ниже к ним могут дописаться найденные фрагменты.
   let system = provider.systemPrompt
   try {
-    // Найденные фрагменты корпуса дописываются в промпт до вызова модели.
+    // Поиск по корпусу до вызова модели: в промпт кладём уже найденный текст, не просим модель искать самой.
+    // latest.content — последнее сообщение пользователя. signal оборвёт поиск, если соединение закрыли.
     const corpus = await corpusContext(latest.content, upstreamAbort.signal)
+    // Пока искали, клиент мог уйти. Дальше писать в сокет и звать модель не нужно.
     if (upstreamAbort.signal.aborted || res.destroyed) return
     if (corpus) {
+      // Фрагменты идут после инструкций, отдельным блоком. Модель видит и правила, и цитаты.
       system = `${provider.systemPrompt}\n\n${corpus.text}`
+      // В лог чата: какой режим сработал (bm25, hybrid, hybrid+rerank), сколько фрагментов и был ли сбой эмбеддингов.
       llm.line(`корпус: ${corpus.mode}, фрагментов ${corpus.count}${corpus.warning ? `, ${corpus.warning}` : ''}`)
     } else {
+      // Пустой вопрос, пустой корпус или ни один чанк не подошёл. Модель отвечает без цитат.
       llm.line('корпус: нет фрагментов')
     }
   } catch (error) {
+    // Ошибка поиска не роняет чат: ответ пойдёт на исходном системном промпте, без корпуса.
     if (upstreamAbort.signal.aborted || res.destroyed) return
     llm.line(`корпус: ${error instanceof Error ? error.message : 'ошибка'}`)
   }
