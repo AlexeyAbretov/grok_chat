@@ -8,7 +8,7 @@ export const WINDOW = 480
 /** Соседние окна заходят друг на друга, чтобы фраза на стыке не пропала. */
 export const OVERLAP = 80
 /**
- * Reciprocal rank fusion. 60 — обычная константа:
+ * Reciprocal rank fusion. 60 — константа c у EnsembleRetriever:
  * места в двух списках остаются близкими, и один индекс не задавливает другой.
  */
 export const RRF_K = 60

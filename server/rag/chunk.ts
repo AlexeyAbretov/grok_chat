@@ -1,3 +1,4 @@
+import { MarkdownTextSplitter } from '@langchain/textsplitters'
 import { OVERLAP, WINDOW, type Chunk, type Document } from './types.ts'
 
 /** Шапка между --- хранит тип, дату, раздел и заголовок. По ним потом фильтруют поиск. */
@@ -23,35 +24,47 @@ export function parseDocument(source: string, raw: string): Document {
 }
 
 /**
- * Сначала режет по заголовкам, потом по абзацам, длинный абзац — окном с перекрытием.
- * У каждого куска один parentId на всю секцию.
+ * Секции режем сами: пакет делит по заголовку только если текст уже длиннее окна.
+ * Длинный абзац внутри секции режет MarkdownTextSplitter, с перекрытием.
+ * Короткие абзацы не склеиваются: у секции остаётся несколько чанков и один parentId.
  */
-export function chunkDocument(doc: Document, options?: { window?: number; overlap?: number }): Chunk[] {
+export async function chunkDocument(doc: Document, options?: { window?: number; overlap?: number }): Promise<Chunk[]> {
   const window = options?.window ?? WINDOW
-  const overlap = options?.overlap ?? OVERLAP
+  const overlap = Math.min(options?.overlap ?? OVERLAP, Math.max(0, window - 1))
+  const splitter = new MarkdownTextSplitter({ chunkSize: window, chunkOverlap: overlap })
   const chunks: Chunk[] = []
-  sectionBlocks(doc.body, doc.title).forEach((block, sectionIndex) => {
+  const blocks = sectionBlocks(doc.body, doc.title)
+  for (let sectionIndex = 0; sectionIndex < blocks.length; sectionIndex += 1) {
+    const block = blocks[sectionIndex]
+    if (!block) continue
     const parentId = `${doc.source}#${sectionIndex}`
     const parentText = `# ${block.title}\n\n${block.body}`
-    let partIndex = 0
-    for (const paragraph of paragraphs(block.body)) {
-      for (const piece of windows(paragraph, window, overlap)) {
-        chunks.push({
-          id: `${parentId}.${partIndex}`,
-          source: doc.source,
-          title: block.title,
-          parentId,
-          text: `${block.title}\n${piece}`,
-          parentText,
-          type: doc.type,
-          date: doc.date,
-          section: doc.section,
-        })
-        partIndex += 1
-      }
-    }
-  })
+    const pieces = await windowPieces(splitter, block.body)
+    pieces.forEach((piece, partIndex) => {
+      chunks.push({
+        id: `${parentId}.${partIndex}`,
+        source: doc.source,
+        title: block.title,
+        parentId,
+        text: `${block.title}\n${piece}`,
+        parentText,
+        type: doc.type,
+        date: doc.date,
+        section: doc.section,
+      })
+    })
+  }
   return chunks
+}
+
+async function windowPieces(splitter: MarkdownTextSplitter, body: string) {
+  const paragraphs = body
+    .split(/\n\s*\n/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+  const pieces: string[] = []
+  for (const paragraph of paragraphs) pieces.push(...(await splitter.splitText(paragraph)))
+  return pieces
 }
 
 function sectionBlocks(body: string, fallbackTitle: string) {
@@ -74,23 +87,4 @@ function sectionBlocks(body: string, fallbackTitle: string) {
   }
   push()
   return blocks
-}
-
-function paragraphs(text: string) {
-  return text
-    .split(/\n\s*\n/)
-    .map((part) => part.trim())
-    .filter(Boolean)
-}
-
-function windows(text: string, window: number, overlap: number) {
-  if (text.length <= window) return [text]
-  const step = Math.max(1, window - overlap)
-  const parts: string[] = []
-  for (let start = 0; start < text.length; start += step) {
-    const end = Math.min(text.length, start + window)
-    parts.push(text.slice(start, end))
-    if (end >= text.length) break
-  }
-  return parts
 }

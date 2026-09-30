@@ -1,10 +1,11 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { buildBm25, tokens, type Bm25Index } from './bm25.ts'
 import { chunkDocument, parseDocument } from './chunk.ts'
 import { embedApiKey, embedModel, embedTexts, rerankApiKey, rerankTexts } from './http.ts'
 import { passagesFromChunks, passagesPrompt } from './prompt.ts'
-import { applyRerank, rankChunkIds } from './rank.ts'
+import { applyRerank } from './rank.ts'
+import { searchChunkIds } from './search.ts'
+import { tokens } from './tokens.ts'
 import {
   PASSAGE_LIMIT,
   RERANK_POOL,
@@ -17,8 +18,8 @@ import {
 
 /**
  * Сборка корпуса и ответ на один вопрос.
- * Чанки и BM25 считаются локально. Векторы кэшируются в data/rag-index.json.
- * В чат уходит гибрид: BM25 и векторы, затем реранк, если есть ключ Cohere.
+ * Нарезка, BM25, векторы, слияние и реранк — пакеты LangChain.
+ * Векторы кэшируются в data/rag-index.json. В чат уходит гибрид, затем реранк, если есть ключ Cohere.
  */
 const DOCS_DIR = resolve('corpus/docs')
 const QUESTIONS_PATH = resolve('corpus/questions.json')
@@ -26,7 +27,6 @@ const CACHE_PATH = resolve('data/rag-index.json')
 
 export type CorpusIndex = {
   chunks: Chunk[]
-  bm25: Bm25Index
   vectors: Map<string, number[]> | null
   model: string | null
   warning: string | null
@@ -129,7 +129,7 @@ export async function rankedSources(
 
 /**
  * vector и bm25 отдают свои первые 5.
- * hybrid сливает верхние 30 и, если просили реранк, пересортировывает 24 кандидата.
+ * hybrid сливает верхние 30 через EnsembleRetriever и, если просили реранк, пересортировывает 24 кандидата.
  */
 async function rankedIds(
   index: CorpusIndex,
@@ -140,9 +140,8 @@ async function rankedIds(
   rerank: boolean,
   signal?: AbortSignal,
 ) {
-  const ids = rankChunkIds({
+  const ids = await searchChunkIds({
     chunks: index.chunks,
-    index: index.bm25,
     vectors: index.vectors,
     query,
     queryVector,
@@ -171,16 +170,16 @@ async function queryVectorFor(index: CorpusIndex, query: string, signal?: AbortS
 }
 
 async function buildIndex(fingerprint: string, embed: 'optional' | 'required', signal?: AbortSignal): Promise<CorpusIndex> {
-  const chunks = loadDocuments().flatMap((doc) => chunkDocument(doc))
-  const bm25 = buildBm25(chunks)
+  const chunks: Chunk[] = []
+  for (const doc of loadDocuments()) chunks.push(...(await chunkDocument(doc)))
   const model = embedModel()
   const key = embedApiKey()
   if (!key) {
     if (embed === 'required') throw new Error('Нет ключа эмбеддингов. Задайте OPENAI_API_KEY или EMBED_API_KEY.')
-    return { chunks, bm25, vectors: null, model: null, warning: null }
+    return { chunks, vectors: null, model: null, warning: null }
   }
   const cached = readCache(fingerprint, model, chunks)
-  if (cached) return { chunks, bm25, vectors: cached, model, warning: null }
+  if (cached) return { chunks, vectors: cached, model, warning: null }
   try {
     const embedded = await embedTexts(chunks.map((chunk) => chunk.text), key, model, signal)
     if (embedded.length !== chunks.length) throw new Error('Эмбеддинги вернули другой размер')
@@ -190,11 +189,11 @@ async function buildIndex(fingerprint: string, embed: 'optional' | 'required', s
       if (vector) vectors.set(chunk.id, vector)
     })
     writeCache(fingerprint, model, vectors)
-    return { chunks, bm25, vectors, model, warning: null }
+    return { chunks, vectors, model, warning: null }
   } catch (error) {
     if (signal?.aborted || embed === 'required') throw error
     const message = errorText(error)
-    return { chunks, bm25, vectors: null, model: null, warning: message }
+    return { chunks, vectors: null, model: null, warning: message }
   }
 }
 
@@ -253,7 +252,7 @@ function readCache(fingerprint: string, model: string, chunks: readonly Chunk[])
       fingerprint?: string
       vectors?: { id?: string; vector?: unknown }[]
     }
-    if (parsed.version !== 1 || parsed.model !== model || parsed.fingerprint !== fingerprint || !Array.isArray(parsed.vectors)) return null
+    if (parsed.version !== 2 || parsed.model !== model || parsed.fingerprint !== fingerprint || !Array.isArray(parsed.vectors)) return null
     const map = new Map<string, number[]>()
     for (const item of parsed.vectors) {
       if (!item || typeof item.id !== 'string' || !Array.isArray(item.vector)) return null
@@ -273,7 +272,7 @@ function readCache(fingerprint: string, model: string, chunks: readonly Chunk[])
 function writeCache(fingerprint: string, model: string, vectors: Map<string, number[]>) {
   mkdirSync(resolve('data'), { recursive: true })
   const payload = {
-    version: 1,
+    version: 2,
     model,
     fingerprint,
     vectors: [...vectors].map(([id, vector]) => ({ id, vector })),
